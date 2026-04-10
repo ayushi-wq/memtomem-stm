@@ -251,8 +251,10 @@ class McpClientSearchAdapter:
         content...
         """
         results: list[RemoteSearchResult] = []
-        # Split by result separators
-        blocks = re.split(r"^---\s*", text, flags=re.MULTILINE)
+        # Split by result separators — require score bracket to avoid
+        # collisions with YAML frontmatter or markdown horizontal rules
+        # inside the content itself.
+        blocks = re.split(r"^---\s*(?=\[[\d.]+\])", text, flags=re.MULTILINE)
 
         for block in blocks:
             block = block.strip()

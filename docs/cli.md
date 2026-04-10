@@ -87,7 +87,7 @@ mms status
 mms remove github
 ```
 
-## MCP Tools (6 + proxied)
+## MCP Tools (7 + proxied)
 
 These are exposed by the `memtomem-stm` MCP server and become available to your agent once it's connected.
 
@@ -97,6 +97,7 @@ These are exposed by the `memtomem-stm` MCP server and become available to your 
 | `stm_proxy_select_chunks` | `key`, `sections[]` | Retrieve sections from a selective/hybrid TOC response |
 | `stm_proxy_read_more` | `key`, `offset`, `limit?` | Read next chunk from a progressive delivery response |
 | `stm_proxy_cache_clear` | `server?`, `tool?` | Clear response cache (all, by server, by tool, or by server+tool) |
+| `stm_proxy_health` | — | Upstream server connectivity and circuit breaker status |
 | `stm_surfacing_feedback` | `surfacing_id`, `rating`, `memory_id?` | Rate surfaced memories (`helpful` / `not_relevant` / `already_known`) |
 | `stm_surfacing_stats` | `tool?` | Surfacing event counts, feedback breakdown, helpfulness % |
 

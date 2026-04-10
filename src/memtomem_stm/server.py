@@ -34,15 +34,6 @@ class STMContext:
 
 CtxType = Context[ServerSession, STMContext]
 
-mcp = FastMCP(
-    "memtomem-stm",
-    instructions=(
-        "Short-term memory proxy gateway with proactive memory surfacing. "
-        "Proxies upstream MCP servers with response compression and caching, "
-        "and automatically surfaces relevant memories from memtomem LTM."
-    ),
-)
-
 
 @asynccontextmanager
 async def app_lifespan(server: FastMCP) -> AsyncIterator[STMContext]:
@@ -99,10 +90,10 @@ async def app_lifespan(server: FastMCP) -> AsyncIterator[STMContext]:
                 )
                 mcp_adapter = None
 
-            if config.surfacing.feedback_enabled:
-                feedback_tracker = FeedbackTracker(config.surfacing)
-
             if mcp_adapter is not None:
+                if config.surfacing.feedback_enabled:
+                    feedback_tracker = FeedbackTracker(config.surfacing)
+
                 surfacing_engine = SurfacingEngine(
                     config.surfacing,
                     mcp_adapter=mcp_adapter,
@@ -151,7 +142,7 @@ async def app_lifespan(server: FastMCP) -> AsyncIterator[STMContext]:
 
         for info in proxy_manager.get_proxy_tools():
             register_proxy_tool(
-                mcp,
+                server,
                 _make_proxy_handler(proxy_manager, info.server, info.original_name),
                 info,
             )
@@ -168,7 +159,7 @@ async def app_lifespan(server: FastMCP) -> AsyncIterator[STMContext]:
     finally:
         for info in proxy_manager.get_proxy_tools():
             try:
-                mcp.remove_tool(info.prefixed_name)
+                server.remove_tool(info.prefixed_name)
             except Exception:
                 pass
         try:
@@ -199,7 +190,15 @@ async def app_lifespan(server: FastMCP) -> AsyncIterator[STMContext]:
                 pass
 
 
-mcp._lifespan_handler = app_lifespan  # type: ignore[attr-defined]
+mcp = FastMCP(
+    "memtomem-stm",
+    instructions=(
+        "Short-term memory proxy gateway with proactive memory surfacing. "
+        "Proxies upstream MCP servers with response compression and caching, "
+        "and automatically surfaces relevant memories from memtomem LTM."
+    ),
+    lifespan=app_lifespan,
+)
 
 
 def _get_ctx(ctx: CtxType) -> STMContext:

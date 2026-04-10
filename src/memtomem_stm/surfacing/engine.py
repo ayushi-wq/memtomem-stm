@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import itertools
 import logging
 import uuid
 from typing import Any
@@ -276,12 +277,12 @@ class SurfacingEngine:
         new_ids = [str(r.chunk.id) for r in relevant]
         for mid in new_ids:
             self._surfaced_ids.add(mid)
-        # Prune if exceeded cap (drop oldest half)
+        # Prune if exceeded cap (drop oldest half via snapshot to avoid
+        # RuntimeError from modifying a set during iteration).
         if len(self._surfaced_ids) > self._surfaced_ids_max:
             excess = len(self._surfaced_ids) - self._surfaced_ids_max // 2
-            it = iter(self._surfaced_ids)
-            for _ in range(excess):
-                self._surfaced_ids.discard(next(it))
+            to_remove = list(itertools.islice(self._surfaced_ids, excess))
+            self._surfaced_ids -= set(to_remove)
         if self._feedback_tracker is not None:
             try:
                 self._feedback_tracker.store.mark_surfaced(new_ids)
