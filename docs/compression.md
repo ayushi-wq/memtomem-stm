@@ -11,18 +11,16 @@ flowchart TD
     T -->|"large JSON<br/>array"| SP["schema_pruning"]
     T -->|"markdown +<br/>headings"| H["hybrid"]
     T -->|"API doc /<br/>schema"| Sk["skeleton"]
-    T -->|"large structured<br/>doc"| Sel["selective<br/>(2-phase TOC)"]
     T -->|"small / plain"| Tr["truncate"]
     Fixed --> Out["compressed<br/>response"]
     EF --> Out
     SP --> Out
     H --> Out
     Sk --> Out
-    Sel --> Out
     Tr --> Out
 ```
 
-> **Note**: `progressive` and `llm_summary` are **never** chosen by `auto` — they're opt-in only because they change the agent interaction pattern (progressive needs `stm_proxy_read_more`; `llm_summary` adds external API latency).
+> **Note**: `progressive`, `llm_summary`, and `selective` are **never** chosen by `auto` — they're opt-in only because they change the agent interaction pattern (progressive needs `stm_proxy_read_more`; selective needs `stm_proxy_select_chunks`; `llm_summary` adds external API latency).
 
 | Strategy | Best for | Description |
 |----------|----------|-------------|

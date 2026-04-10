@@ -44,13 +44,33 @@ def register_proxy_tool(
     info: Any,  # ProxyToolInfo
 ) -> None:
     """Register a proxy tool with the upstream's actual schema and annotations."""
-    server.add_tool(
-        handler,
-        name=info.prefixed_name,
-        description=f"[proxied] {info.description}",
-        annotations=info.annotations,
-    )
-    registered = server._tool_manager._tools.get(info.prefixed_name)
+    try:
+        server.add_tool(
+            handler,
+            name=info.prefixed_name,
+            description=f"[proxied] {info.description}",
+            annotations=info.annotations,
+        )
+    except Exception:
+        import logging
+
+        logging.getLogger(__name__).warning(
+            "Failed to register proxy tool '%s' — FastMCP API may have changed",
+            info.prefixed_name,
+            exc_info=True,
+        )
+        return
+    try:
+        registered = server._tool_manager._tools.get(info.prefixed_name)
+    except AttributeError:
+        import logging
+
+        logging.getLogger(__name__).warning(
+            "Cannot override schema for '%s' — FastMCP internal API changed. "
+            "Tool is registered but may show incorrect parameter schema.",
+            info.prefixed_name,
+        )
+        return
     if registered is not None:
         if info.input_schema:
             registered.parameters = info.input_schema

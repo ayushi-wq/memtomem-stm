@@ -321,8 +321,7 @@ class ProxyConfig(BaseModel):
             mode = resolved.stat().st_mode & 0o777
             if mode & 0o077:
                 logger.warning(
-                    "Proxy config %s has permissive mode %o — "
-                    "consider restricting to 0600",
+                    "Proxy config %s has permissive mode %o — consider restricting to 0600",
                     resolved,
                     mode,
                 )
@@ -363,8 +362,6 @@ class ProxyConfigLoader:
             if loaded is not None:
                 self._cached = loaded
             else:
-                logger.warning(
-                    "Proxy config parse failed; keeping previous config"
-                )
+                logger.warning("Proxy config parse failed; keeping previous config")
             self._mtime = mtime
         return self._cached  # type: ignore[return-value]

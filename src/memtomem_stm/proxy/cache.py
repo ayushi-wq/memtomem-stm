@@ -163,9 +163,10 @@ class ProxyCache:
         if self._db is None:
             return {"total_entries": 0, "expired_entries": 0}
         now = time.time()
-        total = self._db.execute("SELECT COUNT(*) FROM proxy_cache").fetchone()[0]
-        expired = self._db.execute(
-            "SELECT COUNT(*) FROM proxy_cache WHERE ttl_seconds IS NOT NULL AND created_at + ttl_seconds <= ?",
-            (now,),
-        ).fetchone()[0]
+        with self._lock:
+            total = self._db.execute("SELECT COUNT(*) FROM proxy_cache").fetchone()[0]
+            expired = self._db.execute(
+                "SELECT COUNT(*) FROM proxy_cache WHERE ttl_seconds IS NOT NULL AND created_at + ttl_seconds <= ?",
+                (now,),
+            ).fetchone()[0]
         return {"total_entries": total, "expired_entries": expired}

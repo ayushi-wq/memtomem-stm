@@ -388,7 +388,11 @@ class TruncateCompressor:
                     else:
                         cut = len(enriched[summary_idx]) + remaining
                         # Find a word boundary near the cut point
-                        while cut > len(enriched[summary_idx]) and cut < len(summary_body) and summary_body[cut] not in " \n\t":
+                        while (
+                            cut > len(enriched[summary_idx])
+                            and cut < len(summary_body)
+                            and summary_body[cut] not in " \n\t"
+                        ):
                             cut -= 1
                         enriched[summary_idx] = summary_body[:cut]
 
@@ -561,7 +565,7 @@ class TruncateCompressor:
         end = min(max_chars, len(text) - 1)
         floor = max(1, int(max_chars * 0.8))
         for i in range(end, floor - 1, -1):
-            if i >= 1 and text[i - 1] in ".!?\n" and (i >= len(text) or text[i] in " \n\t"):
+            if i >= 1 and text[i - 1] in ".!?\n。！？" and (i >= len(text) or text[i] in " \n\t"):
                 return i
         for i in range(end, floor - 1, -1):
             if i < len(text) and text[i] in " \n\t":
@@ -1037,7 +1041,10 @@ class LLMCompressor:
     _ANTHROPIC_VERSION = "2023-06-01"
 
     _KNOWN_HOSTS = {
-        "api.openai.com", "api.anthropic.com", "localhost", "127.0.0.1",
+        "api.openai.com",
+        "api.anthropic.com",
+        "localhost",
+        "127.0.0.1",
     }
 
     def __init__(self, config: LLMCompressorConfig) -> None:
@@ -1049,6 +1056,7 @@ class LLMCompressor:
         # Warn about non-standard base_url to flag potential credential exfiltration
         if config.base_url:
             from urllib.parse import urlparse
+
             host = urlparse(config.base_url).hostname or ""
             if host and host not in self._KNOWN_HOSTS and not host.endswith(".local"):
                 logger.warning(

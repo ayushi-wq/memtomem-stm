@@ -367,18 +367,18 @@ class TestUnknownServer:
 
 
 class TestErrorResult:
-    async def test_error_result_returned_as_is(self):
-        """When upstream returns isError=True, raw text is returned (no compression)."""
+    async def test_error_result_raises_tool_error(self):
+        """When upstream returns isError=True, ToolError is raised to propagate the error flag."""
+        from mcp.server.fastmcp.exceptions import ToolError
+
         mgr = _make_manager(compression=CompressionStrategy.TRUNCATE, max_result_chars=10)
         session = _get_session(mgr)
         long_error = "Error: " + "x" * 500
         session.call_tool.return_value = _make_result(long_error, is_error=True)
 
         with patch.object(mgr, "_reconnect_server", new_callable=AsyncMock):
-            result = await mgr.call_tool("srv", "tool", {})
-
-        # Error result passes through uncompressed
-        assert result == long_error
+            with pytest.raises(ToolError, match="Error:"):
+                await mgr.call_tool("srv", "tool", {})
 
 
 # ── Empty/non-text response ──────────────────────────────────────────────

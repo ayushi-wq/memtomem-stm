@@ -120,6 +120,13 @@ class ProxyManager:
 
     async def start(self) -> None:
         """Connect to all upstream servers, discover their tools."""
+        # Guard against double start — close previous stack to avoid leaking connections
+        if self._stack is not None:
+            try:
+                await self._stack.aclose()
+            except Exception:
+                logger.debug("Failed to close previous stack in double-start guard", exc_info=True)
+            self._connections.clear()
         self._stack = AsyncExitStack()
 
         servers = self._config.upstream_servers
@@ -334,7 +341,10 @@ class ProxyManager:
             kwargs["store"] = store
         return SelectiveCompressor(**kwargs)
 
-    def _resolve_tool_config(self, server: str, tool: str) -> ToolConfig:
+    def _resolve_tool_config(
+        self, server: str, tool: str, proxy_cfg: ProxyConfig | None = None
+    ) -> ToolConfig:
+        config = proxy_cfg or self._config
         conn = self._connections[server]
         cfg = conn.config
 
@@ -342,7 +352,7 @@ class ProxyManager:
         # Use model-aware budget if server uses default max_result_chars
         _default_server_max = UpstreamServerConfig.model_fields["max_result_chars"].default
         if cfg.max_result_chars == _default_server_max:
-            max_chars = self._config.effective_max_result_chars()
+            max_chars = config.effective_max_result_chars()
         else:
             max_chars = cfg.max_result_chars
         llm_cfg = cfg.llm
@@ -350,11 +360,11 @@ class ProxyManager:
         hybrid_cfg = cfg.hybrid
         cleaning_cfg = cfg.cleaning or CleaningConfig()
 
-        auto_index_enabled = self._config.auto_index.enabled
+        auto_index_enabled = config.auto_index.enabled
         if cfg.auto_index is not None:
             auto_index_enabled = cfg.auto_index
 
-        extraction_enabled = self._config.extraction.enabled
+        extraction_enabled = config.extraction.enabled
         if cfg.extraction is not None:
             extraction_enabled = cfg.extraction
 
@@ -747,6 +757,10 @@ class ProxyManager:
         trace_id = uuid.uuid4().hex[:16]
         logger.debug("trace_id=%s server=%s tool=%s", trace_id, server, tool)
 
+        # Snapshot config once to avoid intra-request inconsistency from
+        # hot-reload changing the config between accesses.
+        cfg_snap = self._config
+
         # Extract _context_query before forwarding
         context_query = arguments.get("_context_query") if arguments else None
         upstream_args = (
@@ -758,8 +772,10 @@ class ProxyManager:
             cached = self._cache.get(server, tool, upstream_args)
             if cached is not None:
                 self.tracker.record_cache_hit()
-                # Re-apply surfacing on cache hit so memories stay fresh
-                cached = await self._apply_surfacing(server, tool, upstream_args, cached)
+                # Re-apply surfacing on cache hit so memories stay fresh.
+                # Use original arguments (with _context_query) so the
+                # surfacing engine can use the agent's explicit query hint.
+                cached = await self._apply_surfacing(server, tool, arguments, cached)
                 return cached
             self.tracker.record_cache_miss()
 
@@ -867,9 +883,18 @@ class ProxyManager:
             else:
                 non_text_content.append(content)
 
-        # Non-text only → pass through without compression
+        # Non-text only → pass through without compression but record metrics
         if not text_parts:
             if non_text_content:
+                self.tracker.record(
+                    CallMetrics(
+                        server=server,
+                        tool=tool,
+                        original_chars=0,
+                        compressed_chars=0,
+                        trace_id=trace_id,
+                    )
+                )
                 return non_text_content
             return "[empty response]"
 
@@ -887,10 +912,14 @@ class ProxyManager:
                     trace_id=trace_id,
                 )
             )
-            return original_text
+            # Propagate upstream isError so FastMCP sets isError=true on the
+            # proxied response instead of silently converting to a normal result.
+            from mcp.server.fastmcp.exceptions import ToolError
 
-        # Resolve effective settings
-        tc = self._resolve_tool_config(server, tool)
+            raise ToolError(original_text)
+
+        # Resolve effective settings (using config snapshot)
+        tc = self._resolve_tool_config(server, tool, proxy_cfg=cfg_snap)
 
         # ── Stage 1: CLEAN ──
         _t0 = _time.monotonic()
@@ -915,7 +944,7 @@ class ProxyManager:
             # Dynamic scaling: shorter content → higher retention (less to gain from cutting).
             # This is the SINGLE place where retention is enforced — compressors trust max_chars.
             effective_max_chars = tc.max_chars
-            min_retention = getattr(self._config, "min_result_retention", 0.65)
+            min_retention = getattr(cfg_snap, "min_result_retention", 0.65)
             if min_retention > 0:
                 n = len(cleaned)
                 # Scale: short content (< 1KB) gets ~90% retention, large (10KB+) gets base
@@ -954,7 +983,7 @@ class ProxyManager:
             _surface_ms = (_time.monotonic() - _t0) * 1000
 
         # ── Stage 4: INDEX (optional) ──
-        ai_cfg = self._config.auto_index
+        ai_cfg = cfg_snap.auto_index
         if (
             tc.auto_index_enabled
             and self._index_engine is not None
@@ -975,7 +1004,7 @@ class ProxyManager:
             final_result = surfaced
 
         # ── Stage 4b: EXTRACT (optional, background by default) ──
-        ext_cfg = self._config.extraction
+        ext_cfg = cfg_snap.extraction
         if (
             tc.extraction_enabled
             and self._index_engine is not None
@@ -1032,7 +1061,7 @@ class ProxyManager:
                 tool,
                 upstream_args,
                 compressed,
-                ttl_seconds=self._config.cache.default_ttl_seconds,
+                ttl_seconds=cfg_snap.cache.default_ttl_seconds,
             )
 
         # Combine compressed text with preserved non-text content

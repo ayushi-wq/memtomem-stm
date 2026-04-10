@@ -272,12 +272,14 @@ class TestManagerErrorRecording:
         assert s["errors_by_category"]["timeout"] == 1
 
     async def test_upstream_error_records_metric(self):
+        from mcp.server.fastmcp.exceptions import ToolError
+
         mgr = _make_manager()
         mgr._connections["srv"].session.call_tool.return_value = _make_result(
             "Error: not found", is_error=True
         )
-        result = await mgr.call_tool("srv", "tool", {})
-        assert "not found" in result
+        with pytest.raises(ToolError, match="not found"):
+            await mgr.call_tool("srv", "tool", {})
         s = mgr.tracker.get_summary()
         assert s["errors_by_category"]["upstream_error"] == 1
 

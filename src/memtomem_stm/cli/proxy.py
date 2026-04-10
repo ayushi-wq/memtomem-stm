@@ -16,11 +16,18 @@ _PREFIX_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9_]*$")
 _DEFAULT_CONFIG = Path("~/.memtomem/stm_proxy.json")
 
 # Environment variable names that could enable code injection via subprocess
-_DANGEROUS_ENV_KEYS = frozenset({
-    "LD_PRELOAD", "LD_LIBRARY_PATH", "DYLD_INSERT_LIBRARIES",
-    "DYLD_LIBRARY_PATH", "DYLD_FRAMEWORK_PATH", "PYTHONPATH",
-    "PYTHONSTARTUP", "NODE_OPTIONS",
-})
+_DANGEROUS_ENV_KEYS = frozenset(
+    {
+        "LD_PRELOAD",
+        "LD_LIBRARY_PATH",
+        "DYLD_INSERT_LIBRARIES",
+        "DYLD_LIBRARY_PATH",
+        "DYLD_FRAMEWORK_PATH",
+        "PYTHONPATH",
+        "PYTHONSTARTUP",
+        "NODE_OPTIONS",
+    }
+)
 
 
 def _load(config_path: Path) -> dict[str, Any]:
@@ -135,7 +142,9 @@ def list_servers(config_path: str) -> None:
     default="auto",
     show_default=True,
 )
-@click.option("--max-chars", "max_result_chars", type=click.IntRange(min=1), default=8000, show_default=True)
+@click.option(
+    "--max-chars", "max_result_chars", type=click.IntRange(min=1), default=8000, show_default=True
+)
 def add(
     name: str,
     config_path: str,

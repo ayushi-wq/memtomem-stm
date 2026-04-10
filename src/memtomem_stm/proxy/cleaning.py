@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import logging as _logging
 import re
+import unicodedata
 from typing import Protocol
 
 _CODE_FENCE_RE = re.compile(r"(```[\s\S]*?```|`[^`\n]+`)")
@@ -25,8 +27,6 @@ _INJECTION_PATTERNS = [
     re.compile(r"(?i)<\s*system\s*>"),
 ]
 
-import logging as _logging
-
 _logger = _logging.getLogger(__name__)
 
 
@@ -44,6 +44,8 @@ class DefaultContentCleaner:
     def clean(self, text: str) -> str:
         if not text:
             return text
+        # Normalize line endings — upstream servers on Windows may send \r\n
+        text = text.replace("\r\n", "\n").replace("\r", "\n")
         self._check_injection(text)
         if self._strip_html:
             text = self._strip_html_jsx(text)
@@ -58,6 +60,9 @@ class DefaultContentCleaner:
     def _check_injection(text: str) -> None:
         """Log a warning if the text contains likely prompt injection patterns."""
         sample = text[:10_000]
+        # NFKC-normalize to defeat Unicode confusable bypasses (e.g.
+        # Cyrillic or fullwidth substitutions for ASCII letters).
+        sample = unicodedata.normalize("NFKC", sample)
         for pat in _INJECTION_PATTERNS:
             m = pat.search(sample)
             if m:
