@@ -161,6 +161,8 @@ Metrics are persisted to SQLite (`~/.memtomem/proxy_metrics.db`, max 10K entries
 
 ```bash
 pip install "memtomem-stm[langfuse]"
+# or with uv:
+uv pip install "memtomem-stm[langfuse]"
 
 export MEMTOMEM_STM_LANGFUSE__ENABLED=true
 export MEMTOMEM_STM_LANGFUSE__PUBLIC_KEY=pk-...

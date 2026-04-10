@@ -57,6 +57,8 @@ See [Surfacing → Surfacing Controls](surfacing.md#surfacing-controls) for the 
 
 ```bash
 pip install "memtomem-stm[langfuse]"
+# or with uv:
+uv pip install "memtomem-stm[langfuse]"
 
 export MEMTOMEM_STM_LANGFUSE__ENABLED=true
 export MEMTOMEM_STM_LANGFUSE__PUBLIC_KEY=pk-...
