@@ -251,6 +251,7 @@ class FactExtractor:
         return merged[: self._cfg.max_facts]
 
     async def _call_api(self, text: str) -> str:
+        assert self._client is not None
         system_prompt = self._llm_cfg.system_prompt.format(max_facts=self._cfg.max_facts)
         match self._llm_cfg.provider:
             case LLMProvider.OPENAI:
@@ -261,6 +262,7 @@ class FactExtractor:
                 return await self._ollama(text, system_prompt)
 
     async def _openai(self, text: str, system_prompt: str) -> str:
+        assert self._client is not None
         url = (
             self._llm_cfg.base_url.rstrip("/") + "/v1/chat/completions"
             if self._llm_cfg.base_url
@@ -282,6 +284,7 @@ class FactExtractor:
         return resp.json()["choices"][0]["message"]["content"]
 
     async def _anthropic(self, text: str, system_prompt: str) -> str:
+        assert self._client is not None
         url = (
             self._llm_cfg.base_url.rstrip("/") + "/v1/messages"
             if self._llm_cfg.base_url
@@ -304,6 +307,7 @@ class FactExtractor:
         return resp.json()["content"][0]["text"]
 
     async def _ollama(self, text: str, system_prompt: str) -> str:
+        assert self._client is not None
         base = self._llm_cfg.base_url or "http://localhost:11434"
         url = base.rstrip("/") + "/api/chat"
         resp = await self._client.post(

@@ -72,10 +72,10 @@ class BM25Scorer:
         for i in range(n):
             total = 0.0
             for t in query_terms:
-                tf = doc_tfs[i].get(t, 0.0)
+                tf_val = doc_tfs[i].get(t, 0.0)
                 idf = idfs.get(t, 0.0)
-                num = tf * (self._k1 + 1.0)
-                den = tf + self._k1 * (1.0 - self._b + self._b * doc_lens[i] / avgdl)
+                num = tf_val * (self._k1 + 1.0)
+                den = tf_val + self._k1 * (1.0 - self._b + self._b * doc_lens[i] / avgdl)
                 total += idf * num / den if den > 0 else 0.0
             scores.append(total)
         return scores

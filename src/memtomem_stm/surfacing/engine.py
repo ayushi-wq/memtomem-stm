@@ -97,7 +97,7 @@ class SurfacingEngine:
             return response_text
 
         query = self._extractor.extract_query(server, tool, arguments, self._config)
-        if not self._gate.should_surface(server, tool, query):
+        if query is None or not self._gate.should_surface(server, tool, query):
             logger.debug(
                 "Surfacing skipped: gate rejected %s/%s (query=%s)",
                 server,

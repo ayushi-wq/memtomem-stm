@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     from memtomem_stm.proxy.cache import ProxyCache
     from memtomem_stm.proxy.protocols import FileIndexer
+    from memtomem_stm.proxy.relevance import RelevanceScorer
     from memtomem_stm.surfacing.engine import SurfacingEngine
 
 from mcp import ClientSession
@@ -234,7 +235,7 @@ class ProxyManager:
         """Remove description/examples from schema properties to save tokens."""
         if not strip_descriptions or not isinstance(schema, dict):
             return schema
-        result = {}
+        result: dict[str, Any] = {}
         for k, v in schema.items():
             if k in ("description", "examples"):
                 continue
@@ -289,7 +290,7 @@ class ProxyManager:
         return result
 
     @staticmethod
-    def _create_scorer(config: ProxyConfig) -> object:
+    def _create_scorer(config: ProxyConfig) -> RelevanceScorer:
         """Create a RelevanceScorer from proxy config."""
         from memtomem_stm.proxy.relevance import create_scorer
 
@@ -600,7 +601,7 @@ class ProxyManager:
             indexed_count = 0
 
             for i, fact in enumerate(facts[: ext_cfg.max_facts]):
-                if dedup:
+                if dedup and self._index_engine is not None:
                     try:
                         is_dup = await self._index_engine.is_duplicate(
                             fact.content,
@@ -618,6 +619,8 @@ class ProxyManager:
                 md_content = self._format_fact_md(fact, server, tool, arguments)
                 file_path.write_text(md_content, encoding="utf-8")
 
+                if self._index_engine is None:
+                    continue
                 try:
                     await self._index_engine.index_file(file_path, namespace=ns)
                     indexed_count += 1
