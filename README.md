@@ -33,6 +33,14 @@ flowchart TB
 pip install memtomem-stm
 ```
 
+Or with [uv](https://docs.astral.sh/uv/):
+
+```bash
+uv tool install memtomem-stm     # install mms / memtomem-stm as global CLI tools
+uvx memtomem-stm --help          # or run without installing
+uv pip install memtomem-stm      # or install into the active environment
+```
+
 memtomem-stm is **independent**: it has no Python-level dependency on memtomem core. To enable proactive memory surfacing, point STM at a running memtomem MCP server (or any compatible MCP server) — communication happens entirely through the MCP protocol.
 
 ## Quick Start
