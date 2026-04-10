@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -11,6 +12,7 @@ from mcp.server.fastmcp import Context, FastMCP
 from mcp.server.session import ServerSession
 
 from memtomem_stm.config import STMConfig
+from memtomem_stm.proxy.config import ProxyConfig
 from memtomem_stm.proxy.manager import ProxyManager
 from memtomem_stm.proxy.metrics import TokenTracker
 from memtomem_stm.surfacing.engine import SurfacingEngine
@@ -45,6 +47,15 @@ mcp = FastMCP(
 @asynccontextmanager
 async def app_lifespan(server: FastMCP) -> AsyncIterator[STMContext]:
     config = STMConfig()
+
+    # Merge JSON config file if env var MEMTOMEM_STM_PROXY__ENABLED was not
+    # explicitly set.  The CLI writes "enabled": true to the JSON file, but
+    # STMConfig (pydantic-settings) only reads env vars, so without this
+    # merge the proxy would be silently disabled after a normal Quick Start.
+    if not os.environ.get("MEMTOMEM_STM_PROXY__ENABLED"):
+        file_cfg = ProxyConfig.load_from_file(config.proxy.config_path)
+        if file_cfg is not None:
+            config.proxy = file_cfg
 
     # Shared state — populated only when proxy is enabled
     from memtomem_stm.proxy.cache import ProxyCache
@@ -215,9 +226,36 @@ async def stm_proxy_stats(
         f"Original chars:  {summary['total_original_chars']}",
         f"Compressed:      {summary['total_compressed_chars']}",
         f"Savings:         {summary['total_savings_pct']:.1f}%",
+        f"Token savings:   {summary.get('total_token_savings_pct', 0):.1f}%",
         f"Cache hits:      {summary['cache_hits']}",
         f"Cache misses:    {summary['cache_misses']}",
+        f"Reconnects:      {summary.get('reconnects', 0)}",
     ]
+
+    # Error summary
+    total_errors = summary.get("total_errors", 0)
+    if total_errors > 0:
+        lines.append(f"\nErrors: {total_errors} ({summary.get('error_rate', 0):.1f}%)")
+        errors_by_cat = summary.get("errors_by_category", {})
+        for cat, count in sorted(errors_by_cat.items()):
+            lines.append(f"  {cat}: {count}")
+
+    # Latency percentiles
+    latency = summary.get("latency_percentiles", {})
+    if latency.get("total"):
+        t = latency["total"]
+        lines.append(f"\nLatency (ms):    p50={t['p50']}  p95={t['p95']}  p99={t['p99']}")
+
+    # RPS
+    rps = summary.get("current_rps", 0)
+    if rps > 0:
+        lines.append(f"Current RPS:     {rps:.1f}")
+
+    # Progressive delivery
+    prog_first = summary.get("progressive_first_chunks", 0)
+    prog_cont = summary.get("progressive_continuations", 0)
+    if prog_first > 0:
+        lines.append(f"\nProgressive:     {prog_first} first chunks, {prog_cont} continuations")
 
     if summary["by_server"]:
         lines.append("\nBy server:")
@@ -303,7 +341,7 @@ async def stm_proxy_cache_clear(
     """Clear the proxy response cache.
 
     Args:
-        server: If given, only clear entries for this upstream server prefix.
+        server: If given, only clear entries for this upstream server name (the name used in mms add, not the prefix).
         tool: If given, only clear entries for this tool (across all servers, or scoped to server if both provided).
     """
     app = _get_ctx(ctx)
@@ -319,6 +357,37 @@ async def stm_proxy_cache_clear(
     elif tool:
         return f"Cleared {removed} cache entries for tool '{tool}'."
     return f"Cleared all {removed} cache entries."
+
+
+# ---------------------------------------------------------------------------
+# Tool: stm_proxy_health
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+async def stm_proxy_health(
+    ctx: CtxType = None,  # type: ignore[assignment]
+) -> str:
+    """Check upstream server connectivity and proxy health status."""
+    app = _get_ctx(ctx)
+    pm = app.proxy_manager
+
+    health = pm.get_upstream_health()
+    if not health:
+        return "No upstream servers configured."
+
+    lines = ["Upstream Server Health", "====================="]
+    for name, info in health.items():
+        status = "connected" if info["connected"] else "DISCONNECTED"
+        lines.append(f"  {name}: {status} ({info['tools']} tools)")
+
+    surfacing = app.surfacing_engine
+    if surfacing is not None:
+        cb = surfacing._circuit_breaker
+        cb_state = "open (failing)" if cb.is_open else "closed (healthy)"
+        lines.append(f"\nSurfacing circuit breaker: {cb_state}")
+
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------

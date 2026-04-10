@@ -1036,12 +1036,26 @@ class LLMCompressor:
     _ANTHROPIC_URL = "https://api.anthropic.com/v1/messages"
     _ANTHROPIC_VERSION = "2023-06-01"
 
+    _KNOWN_HOSTS = {
+        "api.openai.com", "api.anthropic.com", "localhost", "127.0.0.1",
+    }
+
     def __init__(self, config: LLMCompressorConfig) -> None:
         self._cfg = config
         self._cb = _CircuitBreaker(
             max_failures=3, reset_timeout=60.0, name=f"llm-{config.provider.value}"
         )
         self._client: httpx.AsyncClient | None = httpx.AsyncClient(timeout=30) if httpx else None
+        # Warn about non-standard base_url to flag potential credential exfiltration
+        if config.base_url:
+            from urllib.parse import urlparse
+            host = urlparse(config.base_url).hostname or ""
+            if host and host not in self._KNOWN_HOSTS and not host.endswith(".local"):
+                logger.warning(
+                    "LLM compressor base_url points to non-standard host %r — "
+                    "verify this is intentional (API key may be sent to this host)",
+                    host,
+                )
 
     async def compress(
         self, text: str, *, max_chars: int, privacy_patterns: list[str] | None = None

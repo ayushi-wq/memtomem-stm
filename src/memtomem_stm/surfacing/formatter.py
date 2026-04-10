@@ -68,6 +68,12 @@ class SurfacingFormatter:
 
         match self._config.injection_mode:
             case "prepend":
-                return f"{memory_block}\n\n---\n\n{response_text}"
+                return (
+                    f"<surfaced-memories>\n{memory_block}\n</surfaced-memories>"
+                    f"\n\n{response_text}"
+                )
             case "append" | "section" | _:
-                return f"{response_text}\n\n---\n\n{memory_block}"
+                return (
+                    f"{response_text}\n\n"
+                    f"<surfaced-memories>\n{memory_block}\n</surfaced-memories>"
+                )

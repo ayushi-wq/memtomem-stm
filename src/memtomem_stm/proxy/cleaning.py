@@ -14,6 +14,21 @@ _LINK_LINE_RE = re.compile(r"^\s*[-*]\s*\[.*?\]\(https?://\S+\)")
 _BARE_URL_LINE_RE = re.compile(r"^\s*[-*]?\s*https?://\S+\s*$")
 _GENERIC_RE = re.compile(r"[A-Z]\w{0,60}<[^>]+>")
 
+# Prompt injection heuristic patterns — common LLM manipulation attempts
+_INJECTION_PATTERNS = [
+    re.compile(r"(?i)ignore\s+(all\s+)?(previous|prior|above)\s+(instructions?|prompts?|context)"),
+    re.compile(r"(?i)you\s+are\s+now\s+(a|an|the)\s+"),
+    re.compile(r"(?i)system\s*:\s*you\s+(are|must|should|will)"),
+    re.compile(r"(?i)new\s+instructions?\s*:"),
+    re.compile(r"(?i)forget\s+(everything|all|your)\s+(above|previous|prior)"),
+    re.compile(r"(?i)disregard\s+(all\s+)?(previous|prior|above)"),
+    re.compile(r"(?i)<\s*system\s*>"),
+]
+
+import logging as _logging
+
+_logger = _logging.getLogger(__name__)
+
 
 class ContentCleaner(Protocol):
     def clean(self, text: str) -> str: ...
@@ -29,6 +44,7 @@ class DefaultContentCleaner:
     def clean(self, text: str) -> str:
         if not text:
             return text
+        self._check_injection(text)
         if self._strip_html:
             text = self._strip_html_jsx(text)
         if self._dedup:
@@ -37,6 +53,19 @@ class DefaultContentCleaner:
             text = self._collapse_link_floods(text)
         text = self._normalize_whitespace(text)
         return text.strip()
+
+    @staticmethod
+    def _check_injection(text: str) -> None:
+        """Log a warning if the text contains likely prompt injection patterns."""
+        sample = text[:10_000]
+        for pat in _INJECTION_PATTERNS:
+            m = pat.search(sample)
+            if m:
+                _logger.warning(
+                    "Possible prompt injection detected in upstream response: %r",
+                    m.group(0)[:80],
+                )
+                break
 
     def _strip_html_jsx(self, text: str) -> str:
         fences: list[str] = []

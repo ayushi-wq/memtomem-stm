@@ -15,6 +15,13 @@ _PREFIX_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9_]*$")
 
 _DEFAULT_CONFIG = Path("~/.memtomem/stm_proxy.json")
 
+# Environment variable names that could enable code injection via subprocess
+_DANGEROUS_ENV_KEYS = frozenset({
+    "LD_PRELOAD", "LD_LIBRARY_PATH", "DYLD_INSERT_LIBRARIES",
+    "DYLD_LIBRARY_PATH", "DYLD_FRAMEWORK_PATH", "PYTHONPATH",
+    "PYTHONSTARTUP", "NODE_OPTIONS",
+})
+
 
 def _load(config_path: Path) -> dict[str, Any]:
     resolved = config_path.expanduser().resolve()
@@ -206,6 +213,13 @@ def add(
             k, v = pair.split("=", 1)
             if not k:
                 click.echo(f"Error: --env key must be non-empty, got: {pair}", err=True)
+                sys.exit(1)
+            if k.upper() in _DANGEROUS_ENV_KEYS:
+                click.echo(
+                    f"Error: --env key '{k}' is blocked for security reasons "
+                    "(could enable code injection in spawned processes).",
+                    err=True,
+                )
                 sys.exit(1)
             env_dict[k] = v
         entry["env"] = env_dict

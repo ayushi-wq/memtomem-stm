@@ -54,6 +54,8 @@ class FeedbackStore:
     def initialize(self) -> None:
         self._db_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         self._db = sqlite3.connect(str(self._db_path), check_same_thread=False)
+        self._db.execute("PRAGMA journal_mode=WAL")
+        self._db.execute("PRAGMA busy_timeout=3000")
         self._db.executescript(_SCHEMA)
 
     def close(self) -> None:
@@ -96,13 +98,13 @@ class FeedbackStore:
     ) -> bool:
         if self._db is None:
             return False
-        # Verify surfacing event exists
-        exists = self._db.execute(
-            "SELECT 1 FROM surfacing_events WHERE id = ?", (surfacing_id,)
-        ).fetchone()
-        if not exists:
-            return False
         with self._lock:
+            # Verify surfacing event exists
+            exists = self._db.execute(
+                "SELECT 1 FROM surfacing_events WHERE id = ?", (surfacing_id,)
+            ).fetchone()
+            if not exists:
+                return False
             self._db.execute(
                 "INSERT INTO surfacing_feedback (surfacing_id, memory_id, rating, created_at) "
                 "VALUES (?, ?, ?, ?)",

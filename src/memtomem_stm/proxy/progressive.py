@@ -108,7 +108,7 @@ class ProgressiveChunker:
         )
         return chunk + footer
 
-    def read_chunk(self, content: str, offset: int, limit: int | None = None) -> str:
+    def read_chunk(self, content: str, offset: int, limit: int | None = None, key: str = "") -> str:
         """Return a chunk starting at *offset* with a progressive metadata footer."""
         if offset >= len(content):
             return "(no more content)"
@@ -120,7 +120,7 @@ class ProgressiveChunker:
             # Last chunk — return everything remaining
             chunk = content[offset:]
             footer = self._build_footer(
-                key="",
+                key=key,
                 start=offset,
                 end=len(content),
                 total=len(content),
@@ -135,7 +135,7 @@ class ProgressiveChunker:
         chunk = content[offset:end]
         remaining = len(content) - end
         footer = self._build_footer(
-            key="",
+            key=key,
             start=offset,
             end=end,
             total=len(content),

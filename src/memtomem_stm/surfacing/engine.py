@@ -54,8 +54,10 @@ class SurfacingEngine:
             max_failures=config.circuit_max_failures,
             reset_timeout=config.circuit_reset_seconds,
         )
-        # Track memory IDs surfaced — seeded from persistent store for cross-session dedup
+        # Track memory IDs surfaced — seeded from persistent store for cross-session dedup.
+        # Cap at 10k entries to prevent unbounded growth in long sessions.
         self._surfaced_ids: set[str] = set()
+        self._surfaced_ids_max = 10000
         if feedback_tracker is not None and config.dedup_ttl_seconds > 0:
             try:
                 self._surfaced_ids = feedback_tracker.store.get_seen_ids(config.dedup_ttl_seconds)
@@ -65,11 +67,12 @@ class SurfacingEngine:
                         len(self._surfaced_ids),
                     )
             except Exception:
-                logger.debug("Failed to load cross-session seen IDs", exc_info=True)
+                logger.warning("Failed to load cross-session seen IDs", exc_info=True)
         # In-memory boost guard — at most one mem_do(increment_access) call
         # per surfacing event, even if the agent fires multiple "helpful"
         # ratings for it.
         self._boosted_event_ids: set[str] = set()
+        self._background_tasks: set[asyncio.Task] = set()
 
     async def surface(
         self,
@@ -267,17 +270,23 @@ class SurfacingEngine:
                     scores=[r.score for r in relevant],
                 )
             except Exception:
-                logger.debug("Failed to record surfacing event", exc_info=True)
+                logger.warning("Failed to record surfacing event", exc_info=True)
 
         # Record surfaced IDs to suppress repeats (in-memory + persistent)
         new_ids = [str(r.chunk.id) for r in relevant]
         for mid in new_ids:
             self._surfaced_ids.add(mid)
+        # Prune if exceeded cap (drop oldest half)
+        if len(self._surfaced_ids) > self._surfaced_ids_max:
+            excess = len(self._surfaced_ids) - self._surfaced_ids_max // 2
+            it = iter(self._surfaced_ids)
+            for _ in range(excess):
+                self._surfaced_ids.discard(next(it))
         if self._feedback_tracker is not None:
             try:
                 self._feedback_tracker.store.mark_surfaced(new_ids)
             except Exception:
-                logger.debug("Failed to persist seen memory IDs", exc_info=True)
+                logger.warning("Failed to persist seen memory IDs", exc_info=True)
 
         # Inject memories into response
         result = self._formatter.inject(
@@ -290,7 +299,7 @@ class SurfacingEngine:
 
         # Fire webhook (fire-and-forget)
         if self._webhook_manager and self._config.fire_webhook:
-            asyncio.create_task(
+            task = asyncio.create_task(
                 self._webhook_manager.fire(
                     "surface",
                     {
@@ -303,5 +312,7 @@ class SurfacingEngine:
                     },
                 )
             )
+            self._background_tasks.add(task)
+            task.add_done_callback(self._background_tasks.discard)
 
         return result

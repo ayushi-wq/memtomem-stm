@@ -41,7 +41,8 @@ class TestFormatterInjection:
         fmt = SurfacingFormatter(SurfacingConfig(injection_mode="prepend"))
         results = [FakeResult(FakeChunk(content="remember this"), 0.5)]
         output = fmt.inject("original response", results, "query", surfacing_id="abc123")
-        assert output.startswith("## Relevant Memories")
+        assert output.startswith("<surfaced-memories>")
+        assert "## Relevant Memories" in output
         assert "original response" in output
         assert output.index("remember this") < output.index("original response")
 

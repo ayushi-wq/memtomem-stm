@@ -316,6 +316,18 @@ class ProxyConfig(BaseModel):
         if not resolved.exists():
             logger.debug("Proxy config file not found: %s", resolved)
             return ProxyConfig()
+        # Warn if config is group/world-readable (may contain API keys)
+        try:
+            mode = resolved.stat().st_mode & 0o777
+            if mode & 0o077:
+                logger.warning(
+                    "Proxy config %s has permissive mode %o — "
+                    "consider restricting to 0600",
+                    resolved,
+                    mode,
+                )
+        except OSError:
+            pass
         try:
             data: dict[str, Any] = json.loads(resolved.read_text(encoding="utf-8"))
             return ProxyConfig.model_validate(data)

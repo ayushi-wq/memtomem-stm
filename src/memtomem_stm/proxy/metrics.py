@@ -127,11 +127,12 @@ class TokenTracker:
         # Progressive delivery tracking
         self._progressive_first_chunks = 0
         self._progressive_continuations = 0
-        # Per-call latencies for percentile computation
-        self._clean_latencies: list[float] = []
-        self._compress_latencies: list[float] = []
-        self._surface_latencies: list[float] = []
-        self._total_latencies: list[float] = []
+        # Per-call latencies for percentile computation (bounded rolling window)
+        _LATENCY_WINDOW = 10000
+        self._clean_latencies: deque[float] = deque(maxlen=_LATENCY_WINDOW)
+        self._compress_latencies: deque[float] = deque(maxlen=_LATENCY_WINDOW)
+        self._surface_latencies: deque[float] = deque(maxlen=_LATENCY_WINDOW)
+        self._total_latencies: deque[float] = deque(maxlen=_LATENCY_WINDOW)
 
     def record(self, metrics: CallMetrics) -> None:
         self._rps_tracker.record()
@@ -165,7 +166,7 @@ class TokenTracker:
             try:
                 self._metrics_store.record(metrics)
             except Exception:
-                logger.debug("Failed to persist metrics", exc_info=True)
+                logger.warning("Failed to persist metrics", exc_info=True)
 
     def record_cache_hit(self) -> None:
         self._cache_hits += 1
@@ -194,9 +195,9 @@ class TokenTracker:
             try:
                 self._metrics_store.record(metrics)
             except Exception:
-                logger.debug("Failed to persist error metrics", exc_info=True)
+                logger.warning("Failed to persist error metrics", exc_info=True)
 
-    def _percentiles(self, values: list[float]) -> dict[str, float]:
+    def _percentiles(self, values: deque[float] | list[float]) -> dict[str, float]:
         """Return p50/p95/p99 for a list of latency values."""
         if not values:
             return {"p50": 0.0, "p95": 0.0, "p99": 0.0}

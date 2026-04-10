@@ -116,6 +116,7 @@ class ProxyManager:
         self._progressive_store: ProgressiveStoreAdapter | None = None
         self._progressive_lock = asyncio.Lock()
         self._relevance_scorer = self._create_scorer(config)
+        self._background_tasks: set[asyncio.Task] = set()
 
     async def start(self) -> None:
         """Connect to all upstream servers, discover their tools."""
@@ -199,6 +200,15 @@ class ProxyManager:
         logger.info("Reconnected to '%s' (%s tools)", name, len(conn.tools))
 
     async def stop(self) -> None:
+        # Cancel and drain background tasks (extraction, etc.)
+        for task in self._background_tasks:
+            task.cancel()
+        if self._background_tasks:
+            await asyncio.gather(*self._background_tasks, return_exceptions=True)
+        self._background_tasks.clear()
+        # Close httpx clients
+        if self._extractor is not None:
+            await self._extractor.close()
         for conn in self._connections.values():
             if conn.stack is not None:
                 try:
@@ -710,7 +720,7 @@ class ProxyManager:
         store.touch(key)
         chunk_size = limit or 4000
         chunker = ProgressiveChunker(chunk_size=chunk_size, include_hint=True)
-        return chunker.read_chunk(resp.content, offset, limit)
+        return chunker.read_chunk(resp.content, offset, limit, key=key)
 
     def get_upstream_health(self) -> dict[str, dict]:
         """Return per-server health: connection status, tool count."""
@@ -972,7 +982,7 @@ class ProxyManager:
             and len(cleaned) >= ext_cfg.min_response_chars
         ):
             if ext_cfg.background:
-                asyncio.create_task(
+                task = asyncio.create_task(
                     self._extract_and_store(
                         server,
                         tool,
@@ -981,6 +991,8 @@ class ProxyManager:
                         context_query=context_query,
                     )
                 )
+                self._background_tasks.add(task)
+                task.add_done_callback(self._background_tasks.discard)
             else:
                 await self._extract_and_store(
                     server,
