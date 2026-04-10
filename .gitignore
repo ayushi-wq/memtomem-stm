@@ -27,3 +27,7 @@ coverage.xml
 # Editors
 .vscode/
 .idea/
+
+# Local-only
+.claude/
+scripts/
