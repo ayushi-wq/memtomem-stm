@@ -31,3 +31,4 @@ coverage.xml
 # Local-only
 .claude/
 scripts/
+CLAUDE.local.md
