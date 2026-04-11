@@ -89,6 +89,10 @@ Your agent now sees proxied tools (`fs__read_file`, `gh__search_repositories`, e
 
 To check what's happening, ask the agent to call `stm_proxy_stats`.
 
+## Tutorial notebooks
+
+Want to see STM's behavior without wiring it into Claude Code first? The [`notebooks/`](notebooks/) directory contains four runnable Jupyter notebooks covering quickstart setup, selective compression, memory surfacing, and a LangChain `create_agent` integration. Clone the repo, run `uv sync`, and `uv run jupyter lab notebooks/` — no external services required for the first three.
+
 ## Key Features
 
 - 🗜️ **10 compression strategies** with auto-selection by content type, query-aware budget allocation, and zero-loss progressive delivery → [docs/compression.md](https://github.com/memtomem/memtomem-stm/blob/main/docs/compression.md)

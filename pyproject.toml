@@ -29,6 +29,11 @@ dependencies = [
 
 [project.optional-dependencies]
 langfuse = ["langfuse>=4.0"]
+langchain = [
+    "langchain>=1.0",
+    "langchain-mcp-adapters>=0.1",
+    "langchain-anthropic>=0.3",
+]
 
 [project.scripts]
 memtomem-stm = "memtomem_stm.server:main"
@@ -54,6 +59,10 @@ dev = [
     "pytest-cov>=6.0",
     "ruff>=0.9",
     "mypy>=1.14",
+    "jupyter>=1.1",
+    "ipykernel>=6.29",
+    "nbclient>=0.10",
+    "nbmake>=1.5",
 ]
 
 [tool.ruff]
