@@ -3,6 +3,12 @@
 All notable changes will be documented in this file.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 
+## [0.1.3] — 2026-04-11
+
+### Fixes
+
+- **Drop phantom `memtomem` runtime dependency** — `pyproject.toml` declared `memtomem>=0.1,<0.2` as a runtime dep, but nothing in `src/` or `tests/` imports `memtomem`: the package talks to the LTM core exclusively through the MCP protocol, as documented in `README.md` and `CONTRIBUTING.md` and required by the invariant in `CLAUDE.md`. The stray entry silently pulled `memtomem` into every `pip install memtomem-stm`, putting the dependency graph at odds with all three documents. Runtime behavior is unchanged; only the dependency graph is cleaner now.
+
 ## [0.1.2] — 2026-04-10
 
 ### Critical
