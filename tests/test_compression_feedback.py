@@ -129,12 +129,8 @@ class TestCompressionFeedbackStore:
         compression.initialize()
 
         try:
-            surfacing.record_surfacing(
-                "surf1", "docfix", "search", "query", ["m1"], [0.9]
-            )
-            compression.record(
-                "docfix", "search", "other", "compression report", None
-            )
+            surfacing.record_surfacing("surf1", "docfix", "search", "query", ["m1"], [0.9])
+            compression.record("docfix", "search", "other", "compression report", None)
 
             # Both subsystems see only their own rows.
             surf_stats = surfacing.get_tool_feedback_summary()
@@ -205,10 +201,7 @@ class TestMetricsStoreLookup:
         try:
             _record_metric(store, "docfix", "get_document", "old_trace")
             _record_metric(store, "docfix", "get_document", "new_trace")
-            assert (
-                store.lookup_recent_trace_id("docfix", "get_document", 1800.0)
-                == "new_trace"
-            )
+            assert store.lookup_recent_trace_id("docfix", "get_document", 1800.0) == "new_trace"
         finally:
             store.close()
 
@@ -219,14 +212,8 @@ class TestMetricsStoreLookup:
             _record_metric(store, "docfix", "get_document", "doc_trace")
             _record_metric(store, "docfix", "search", "search_trace")
             _record_metric(store, "next", "get_document", "next_trace")
-            assert (
-                store.lookup_recent_trace_id("docfix", "get_document", 1800.0)
-                == "doc_trace"
-            )
-            assert (
-                store.lookup_recent_trace_id("docfix", "search", 1800.0)
-                == "search_trace"
-            )
+            assert store.lookup_recent_trace_id("docfix", "get_document", 1800.0) == "doc_trace"
+            assert store.lookup_recent_trace_id("docfix", "search", 1800.0) == "search_trace"
         finally:
             store.close()
 
@@ -238,10 +225,7 @@ class TestMetricsStoreLookup:
             _record_metric(store, "docfix", "get_document", None)
             # Freshest row has NULL trace_id; lookup must fall back to the
             # previous row rather than returning NULL.
-            assert (
-                store.lookup_recent_trace_id("docfix", "get_document", 1800.0)
-                == "first"
-            )
+            assert store.lookup_recent_trace_id("docfix", "get_document", 1800.0) == "first"
         finally:
             store.close()
 
@@ -255,9 +239,7 @@ class TestMetricsStoreLookup:
             # will not see it.
             _backdate_last_row(db_path, delta_seconds=3600.0)
             assert (
-                store.lookup_recent_trace_id(
-                    "docfix", "get_document", TRACE_LOOKUP_WINDOW_SECONDS
-                )
+                store.lookup_recent_trace_id("docfix", "get_document", TRACE_LOOKUP_WINDOW_SECONDS)
                 is None
             )
         finally:
@@ -296,15 +278,9 @@ class TestCompressionFeedbackTracker:
     def test_missing_fields_rejected(self, tmp_path: Path):
         tracker = CompressionFeedbackTracker(tmp_path / "cfb.db")
         try:
-            assert "server and tool" in tracker.record(
-                server="", tool="x", missing="m"
-            )
-            assert "server and tool" in tracker.record(
-                server="x", tool="", missing="m"
-            )
-            assert "missing description" in tracker.record(
-                server="x", tool="y", missing=""
-            )
+            assert "server and tool" in tracker.record(server="", tool="x", missing="m")
+            assert "server and tool" in tracker.record(server="x", tool="", missing="m")
+            assert "missing description" in tracker.record(server="x", tool="y", missing="")
             assert tracker.get_stats()["total_feedback"] == 0
         finally:
             tracker.close()
@@ -325,14 +301,10 @@ class TestCompressionFeedbackTracker:
         finally:
             tracker.close()
 
-    def test_trace_id_lookup_within_window(
-        self, tmp_path: Path, metrics_store: MetricsStore
-    ):
+    def test_trace_id_lookup_within_window(self, tmp_path: Path, metrics_store: MetricsStore):
         _record_metric(metrics_store, "docfix", "get_document", "live_trace")
 
-        tracker = CompressionFeedbackTracker(
-            tmp_path / "cfb.db", metrics_store=metrics_store
-        )
+        tracker = CompressionFeedbackTracker(tmp_path / "cfb.db", metrics_store=metrics_store)
         try:
             result = tracker.record(
                 server="docfix",
@@ -352,9 +324,7 @@ class TestCompressionFeedbackTracker:
         _record_metric(metrics_store, "docfix", "get_document", "stale_trace")
         _backdate_last_row(metrics_db, delta_seconds=3600.0)
 
-        tracker = CompressionFeedbackTracker(
-            tmp_path / "cfb.db", metrics_store=metrics_store
-        )
+        tracker = CompressionFeedbackTracker(tmp_path / "cfb.db", metrics_store=metrics_store)
         try:
             result = tracker.record(
                 server="docfix",
@@ -371,9 +341,7 @@ class TestCompressionFeedbackTracker:
     ):
         _record_metric(metrics_store, "docfix", "get_document", "wrong_tool")
 
-        tracker = CompressionFeedbackTracker(
-            tmp_path / "cfb.db", metrics_store=metrics_store
-        )
+        tracker = CompressionFeedbackTracker(tmp_path / "cfb.db", metrics_store=metrics_store)
         try:
             result = tracker.record(
                 server="docfix",
@@ -398,15 +366,33 @@ class TestCompressionFeedbackTracker:
         finally:
             tracker.close()
 
+    def test_get_tool_feedback_summary_empty(self, tmp_path: Path):
+        tracker = CompressionFeedbackTracker(tmp_path / "cfb.db")
+        try:
+            assert tracker.store.get_tool_feedback_summary() == {}
+        finally:
+            tracker.close()
+
+    def test_get_tool_feedback_summary_aggregates(self, tmp_path: Path):
+        tracker = CompressionFeedbackTracker(tmp_path / "cfb.db")
+        try:
+            tracker.record(server="s", tool="t1", missing="a", kind="truncated")
+            tracker.record(server="s", tool="t1", missing="b", kind="missing_example")
+            tracker.record(server="s", tool="t2", missing="c", kind="truncated")
+
+            summary = tracker.store.get_tool_feedback_summary(since_seconds=3600.0)
+            assert set(summary.keys()) == {"t1", "t2"}
+            assert summary["t1"]["total"] == 2
+            assert summary["t1"]["by_kind"] == {"truncated": 1, "missing_example": 1}
+            assert summary["t2"]["total"] == 1
+        finally:
+            tracker.close()
+
     def test_get_stats_passthrough(self, tmp_path: Path):
         tracker = CompressionFeedbackTracker(tmp_path / "cfb.db")
         try:
-            tracker.record(
-                server="docfix", tool="get_document", missing="x", kind="truncated"
-            )
-            tracker.record(
-                server="docfix", tool="search", missing="y", kind="wrong_topic"
-            )
+            tracker.record(server="docfix", tool="get_document", missing="x", kind="truncated")
+            tracker.record(server="docfix", tool="search", missing="y", kind="wrong_topic")
 
             all_stats = tracker.get_stats()
             assert all_stats["total_feedback"] == 2

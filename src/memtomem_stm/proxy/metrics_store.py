@@ -123,6 +123,81 @@ class MetricsStore:
             )
             self._db.commit()
 
+    def get_tool_profiles(self, since_seconds: float = 86400.0) -> list[dict]:
+        """Aggregate per ``(server, tool)`` stats for auto-tuner analysis.
+
+        Returns a list of dicts with keys: ``server``, ``tool``,
+        ``call_count``, ``violation_count``, ``avg_ratio``,
+        ``p95_original_chars``, ``dominant_strategy``, ``error_count``.
+        Only non-error rows with ``cleaned_chars > 0`` contribute to
+        ``avg_ratio``.  ``p95_original_chars`` is approximated by taking
+        the value at the 95th percentile rank within each group.
+        """
+        if self._db is None:
+            return []
+        cutoff = time.time() - since_seconds
+        # Main aggregation
+        rows = self._db.execute(
+            """
+            SELECT
+                server,
+                tool,
+                COUNT(*)                                          AS call_count,
+                SUM(ratio_violation)                              AS violation_count,
+                AVG(
+                    CASE WHEN cleaned_chars > 0 AND is_error = 0
+                         THEN CAST(compressed_chars AS REAL) / cleaned_chars
+                    END
+                )                                                 AS avg_ratio,
+                SUM(is_error)                                     AS error_count
+            FROM proxy_metrics
+            WHERE created_at >= ?
+            GROUP BY server, tool
+            """,
+            (cutoff,),
+        ).fetchall()
+
+        profiles: list[dict] = []
+        for server, tool, call_count, violation_count, avg_ratio, error_count in rows:
+            # p95 approximation: pick the value at rank ceil(0.95 * N)
+            p95_row = self._db.execute(
+                """
+                SELECT original_chars FROM proxy_metrics
+                WHERE server = ? AND tool = ? AND created_at >= ?
+                ORDER BY original_chars ASC
+                LIMIT 1 OFFSET MAX(0, CAST(
+                    (SELECT COUNT(*) FROM proxy_metrics
+                     WHERE server = ? AND tool = ? AND created_at >= ?)
+                    * 0.95 AS INTEGER) - 1)
+                """,
+                (server, tool, cutoff, server, tool, cutoff),
+            ).fetchone()
+            # Dominant strategy
+            strat_row = self._db.execute(
+                """
+                SELECT compression_strategy FROM proxy_metrics
+                WHERE server = ? AND tool = ? AND created_at >= ?
+                    AND compression_strategy IS NOT NULL
+                GROUP BY compression_strategy
+                ORDER BY COUNT(*) DESC
+                LIMIT 1
+                """,
+                (server, tool, cutoff),
+            ).fetchone()
+            profiles.append(
+                {
+                    "server": server,
+                    "tool": tool,
+                    "call_count": call_count,
+                    "violation_count": violation_count or 0,
+                    "avg_ratio": round(avg_ratio, 4) if avg_ratio is not None else None,
+                    "p95_original_chars": p95_row[0] if p95_row else 0,
+                    "dominant_strategy": strat_row[0] if strat_row else None,
+                    "error_count": error_count or 0,
+                }
+            )
+        return profiles
+
     def get_history(self, limit: int = 100) -> list[dict]:
         if self._db is None:
             return []

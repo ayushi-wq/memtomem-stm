@@ -331,3 +331,91 @@ class TestProxyManagerRatioGuard:
         row = _latest_row(store)
         assert row["ratio_violation"] == 0
         store.close()
+
+
+# ── MetricsStore.get_tool_profiles ──────────────────────────────────────
+
+
+class TestGetToolProfiles:
+    def test_empty_store(self, tmp_path):
+        store = MetricsStore(tmp_path / "metrics.db")
+        store.initialize()
+        assert store.get_tool_profiles() == []
+        store.close()
+
+    def test_basic_aggregation(self, tmp_path):
+        store = MetricsStore(tmp_path / "metrics.db")
+        store.initialize()
+        for i in range(10):
+            store.record(
+                CallMetrics(
+                    server="srv",
+                    tool="t1",
+                    original_chars=5000 + i * 100,
+                    compressed_chars=3000,
+                    cleaned_chars=5000 + i * 100,
+                    compression_strategy="hybrid",
+                    ratio_violation=(i < 2),
+                )
+            )
+        profiles = store.get_tool_profiles(since_seconds=3600.0)
+        assert len(profiles) == 1
+        p = profiles[0]
+        assert p["server"] == "srv"
+        assert p["tool"] == "t1"
+        assert p["call_count"] == 10
+        assert p["violation_count"] == 2
+        assert p["dominant_strategy"] == "hybrid"
+        assert p["avg_ratio"] is not None
+        assert 0 < p["avg_ratio"] < 1
+        assert p["p95_original_chars"] >= 5800
+        store.close()
+
+    def test_groups_by_server_tool(self, tmp_path):
+        store = MetricsStore(tmp_path / "metrics.db")
+        store.initialize()
+        for tool in ("t1", "t2"):
+            store.record(
+                CallMetrics(
+                    server="srv",
+                    tool=tool,
+                    original_chars=1000,
+                    compressed_chars=500,
+                    cleaned_chars=1000,
+                    compression_strategy="truncate",
+                )
+            )
+        profiles = store.get_tool_profiles(since_seconds=3600.0)
+        tools = {p["tool"] for p in profiles}
+        assert tools == {"t1", "t2"}
+        store.close()
+
+    def test_respects_time_window(self, tmp_path):
+        """Rows outside the time window should be excluded."""
+        import sqlite3 as _sq
+        import time as _t
+
+        db_path = tmp_path / "metrics.db"
+        store = MetricsStore(db_path)
+        store.initialize()
+        store.record(
+            CallMetrics(
+                server="srv",
+                tool="t1",
+                original_chars=1000,
+                compressed_chars=500,
+                cleaned_chars=1000,
+                compression_strategy="truncate",
+            )
+        )
+        # Push the row 2 hours into the past
+        conn = _sq.connect(str(db_path))
+        conn.execute(
+            "UPDATE proxy_metrics SET created_at = ?",
+            (_t.time() - 7200,),
+        )
+        conn.commit()
+        conn.close()
+        # 1-hour window should miss the row
+        assert store.get_tool_profiles(since_seconds=3600.0) == []
+        store.close()

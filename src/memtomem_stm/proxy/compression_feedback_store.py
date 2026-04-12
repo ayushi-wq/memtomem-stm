@@ -120,6 +120,29 @@ class CompressionFeedbackStore:
             )
             self._db.commit()
 
+    def get_tool_feedback_summary(self, since_seconds: float = 86400.0) -> dict[str, dict]:
+        """Aggregate feedback per tool for auto-tuner analysis.
+
+        Returns ``{tool: {"total": int, "by_kind": {kind: count}}}``
+        within the given time window.  Returns an empty dict when the
+        store is closed or there are no rows.
+        """
+        if self._db is None:
+            return {}
+        cutoff = time.time() - since_seconds
+        rows = self._db.execute(
+            "SELECT tool, kind, COUNT(*) FROM compression_feedback "
+            "WHERE created_at >= ? GROUP BY tool, kind",
+            (cutoff,),
+        ).fetchall()
+        result: dict[str, dict] = {}
+        for tool_name, kind, count in rows:
+            if tool_name not in result:
+                result[tool_name] = {"total": 0, "by_kind": {}}
+            result[tool_name]["total"] += count
+            result[tool_name]["by_kind"][kind] = count
+        return result
+
     def get_stats(self, tool: str | None = None) -> dict:
         """Return counts for ``stm_compression_stats``.
 
