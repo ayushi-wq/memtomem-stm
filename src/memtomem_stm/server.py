@@ -580,6 +580,50 @@ async def stm_compression_stats(
 
 
 # ---------------------------------------------------------------------------
+# Tool: stm_tuning_recommendations
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+async def stm_tuning_recommendations(
+    since_hours: float = 24.0,
+    tool: str | None = None,
+    ctx: CtxType = None,  # type: ignore[assignment]
+) -> str:
+    """Show per-tool compression tuning recommendations.
+
+    Analyses proxy metrics (and compression feedback when available) to
+    suggest ``max_result_chars``, ``compression`` strategy, and
+    ``retention_floor`` adjustments per tool.  Recommendations are
+    read-only — apply them manually to ``stm_proxy.json``.
+
+    Args:
+        since_hours: Analysis window in hours (default 24).
+        tool: Optional filter to show recommendations for a single tool.
+    """
+    from memtomem_stm.proxy.tuner import CompressionTuner, format_recommendations
+
+    app = _get_ctx(ctx)
+    metrics_store = app.tracker._metrics_store
+    if metrics_store is None:
+        return "Metrics store is not enabled — no data to analyse."
+
+    feedback_store = (
+        app.compression_feedback_tracker.store if app.compression_feedback_tracker else None
+    )
+
+    tuner = CompressionTuner(
+        metrics_store=metrics_store,
+        feedback_store=feedback_store,
+        config=app.proxy_manager._config,
+    )
+    since = since_hours * 3600.0
+    profiles = tuner.get_profiles(since_seconds=since)
+    recs = tuner.analyze(since_seconds=since, tool_filter=tool)
+    return format_recommendations(recs, profiles, since_hours)
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
