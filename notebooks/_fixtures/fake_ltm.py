@@ -3,8 +3,9 @@
 Stands in for a real ``memtomem-server`` so notebook 03 can demonstrate
 proactive surfacing without any external dependencies. Exposes the two
 tools STM's ``McpClientSearchAdapter`` actually calls — ``mem_search``
-and ``mem_do`` — both returning canned responses in the format the
-adapter parses.
+and ``mem_do`` — both returning canned responses in **core's real
+compact format** (``[rank] score | source > hierarchy``) so the notebook
+exercises the same parsing path used in production.
 
 **Why not reuse tests/_fake_memtomem_server.py?** That fixture returns
 fixed memory IDs (``/notes/auth.md``, ``/notes/api.md``). STM's
@@ -31,13 +32,12 @@ async def mem_search(
     query: str,
     top_k: int | None = None,
     namespace: str | list[str] | None = None,
+    context_window: int = 0,
 ) -> str:
-    """Return two canned search hits with per-call unique content.
+    """Return two canned search hits in core's compact format.
 
-    The format matches what STM's ``McpClientSearchAdapter`` parses::
-
-        --- [<score>] <memory_id> ---
-        <content>
+    Matches the output of ``memtomem.server.formatters._format_compact_result``
+    so the notebook exercises the same parsing path used in production.
 
     Critically, STM derives the *chunk ID* used for cross-session dedup
     from ``sha256(content)`` (not from the filename), so the **content
@@ -48,10 +48,11 @@ async def mem_search(
     auth_tag = uuid.uuid4().hex[:8]
     api_tag = uuid.uuid4().hex[:8]
     return (
-        f"--- [0.92] /notes/auth-{auth_tag}.md ---\n"
-        f"JWT authentication uses HS256 with rotating secrets every 24 hours. [run={auth_tag}]\n"
-        f"--- [0.87] /notes/api-{api_tag}.md ---\n"
-        f"All API responses include rate limit headers (X-RateLimit-*). [run={api_tag}]\n"
+        "Found 2 results:\n\n"
+        f"[1] 0.92 | auth-{auth_tag}.md > Authentication\n"
+        f"JWT authentication uses HS256 with rotating secrets every 24 hours. [run={auth_tag}]\n\n"
+        f"[2] 0.87 | api-{api_tag}.md > Rate Limiting\n"
+        f"All API responses include rate limit headers (X-RateLimit-*). [run={api_tag}]"
     )
 
 
