@@ -231,7 +231,7 @@ Routes through an external LLM for intelligent summarization:
 {
   "llm": {
     "provider": "openai",
-    "model": "gpt-4o-mini",
+    "model": "gpt-4.1-mini",
     "api_key": "sk-...",
     "max_tokens": 500,
     "system_prompt": "Summarize concisely, preserving key information. Under {max_chars} chars."
@@ -309,16 +309,26 @@ export MEMTOMEM_STM_PROXY__CONSUMER_MODEL=claude-sonnet-4
 
 | Model | Context | Tier | Notes |
 |-------|---------|------|-------|
-| `o1-mini` | 128K | Medium | Default settings work well |
-| `gpt-4o` | 128K | Medium | Default settings work well |
-| `gpt-4.1` | 1M | LLM | Generous budget, more surfacing |
-| `gpt-4.1-mini` | 1M | LLM | Generous budget, more surfacing |
-| `claude-sonnet-4` | 200K | Medium | Default settings work well |
 | `claude-opus-4` | 200K | Medium | Default settings work well |
-| `o3` / `o4-mini` | 200K | Medium | Reasoning models, default settings |
+| `claude-sonnet-4` | 200K | Medium | Default settings work well |
+| `claude-haiku-4` | 200K | Medium | Default settings work well |
+| `gpt-4.1` | 1M | LLM | Generous budget, more surfacing |
+| `gpt-4.1-mini` | 1M | LLM | **Default LLM compression model**; generous budget |
+| `gpt-4.1-nano` | 1M | LLM | Generous budget, more surfacing |
+| `gpt-4o` | 128K | Medium | Default settings work well |
+| `gpt-4o-mini` | 128K | Medium | Default settings work well |
+| `o4-mini` | 200K | Medium | Reasoning model, default settings |
+| `o3` / `o3-pro` / `o3-mini` | 200K | Medium | Reasoning models, default settings |
+| `o1` / `o1-pro` | 200K | Medium | Reasoning models, default settings |
+| `o1-mini` | 128K | Medium | Default settings work well |
 | `gemini-2.5-pro` | 1M | LLM | Generous budget, more surfacing |
+| `gemini-2.5-flash` | 1M | LLM | Generous budget, more surfacing |
+| `llama-4-maverick` | 1M | LLM | Open-weight, generous budget |
 | `llama-4-scout` | 512K | LLM | Open-weight, generous budget |
-| `deepseek-r1` | 131K | Medium | Default settings work well |
+| `deepseek-r1` / `deepseek-v3` | 131K | Medium | Default settings work well |
 | `qwen-3` | 131K | Medium | Default settings work well |
+| `mistral-large` | 131K | Medium | Default settings work well |
+| `codestral` | 262K | Medium | Code-focused model |
+| `command-a` | 262K | Medium | Cohere, default settings |
 
-All scaling is automatic when `consumer_model` is set. Override any value explicitly to disable auto-scaling for that setting.
+Prefix-matched: `claude-sonnet-4-20250514` matches `claude-sonnet-4`. All scaling is automatic when `consumer_model` is set. Override any value explicitly to disable auto-scaling for that setting.

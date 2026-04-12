@@ -69,8 +69,8 @@ The injection mode is configurable: `prepend` (default), `append`, or `section`.
 |---------|---------|-------------|
 | `enabled` | `true` | Global on/off switch |
 | `min_score` | `0.02` | Minimum search score to include a result |
-| `max_results` | `3` | Maximum memories surfaced per tool call |
-| `max_injection_chars` | `3000` | Maximum total chars injected (truncated if exceeded) |
+| `max_results` | `3` | Maximum memories surfaced per tool call (model-scaled) |
+| `max_injection_chars` | `3000` | Maximum total chars injected, truncated if exceeded (model-scaled) |
 | `min_response_chars` | `5000` | Skip surfacing for small responses |
 | `min_query_tokens` | `3` | Skip if extracted query has fewer tokens |
 | `timeout_seconds` | `3.0` | Surfacing timeout (falls back to original response) |
@@ -80,9 +80,20 @@ The injection mode is configurable: `prepend` (default), `append`, or `section`.
 | `section_header` | `## Relevant Memories` | Header text for injected section |
 | `default_namespace` | `null` | Restrict search to a specific namespace |
 | `exclude_tools` | `[]` | fnmatch patterns to never surface (e.g. `["*debug*"]`) |
-| `write_tool_patterns` | `*write*`, `*create*`, etc. | Auto-skip write/mutation operations |
+| `write_tool_patterns` | `*write*`, `*create*`, `*delete*`, `*push*`, `*send*`, `*remove*` | Auto-skip write/mutation operations |
 | `include_session_context` | `true` | Include working memory (scratch) items |
 | `dedup_ttl_seconds` | `604800` (7d) | Cross-session dedup window; `0` to disable |
+| `context_window_size` | `0` | Expand ±N adjacent chunks around search hits; `0` to disable |
+| `consumer_model` | `""` | Model name for auto-scaling `max_results` and `max_injection_chars` |
+| `feedback_db_path` | `~/.memtomem/stm_feedback.db` | SQLite store for events, feedback, and cross-session dedup |
+| `cache_ttl_seconds` | `60.0` | Internal surfacing result cache TTL |
+| `circuit_max_failures` | `3` | Consecutive failures before circuit breaker opens |
+| `circuit_reset_seconds` | `60.0` | Seconds before half-open probe after circuit opens |
+| `auto_tune_enabled` | `true` | Enable automatic `min_score` adjustment from feedback |
+| `auto_tune_min_samples` | `20` | Minimum feedback entries before adjusting per-tool score |
+| `auto_tune_score_increment` | `0.002` | Step size for `min_score` adjustments |
+| `feedback_enabled` | `true` | Enable the feedback recording and `stm_surfacing_feedback` tool |
+| `fire_webhook` | `true` | Fire surfacing event webhooks |
 
 ## Per-tool Templates
 

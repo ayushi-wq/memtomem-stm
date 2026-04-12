@@ -122,12 +122,13 @@ Want to see STM's behavior without wiring it into Claude Code first? The [`noteb
 ## Development
 
 ```bash
-uv sync                                      # install dev deps
-uv run pytest -m "not ollama"                # tests (CI filter)
-uv run ruff check src && uv run mypy src     # lint + typecheck
+uv sync                                                    # install dev deps
+uv run pytest -m "not ollama"                              # tests (CI filter)
+uv run ruff check src && uv run ruff format --check src    # lint (required)
+uv run mypy src                                            # typecheck (advisory)
 ```
 
-CI runs the same three commands on every PR via `.github/workflows/ci.yml`. Mypy is advisory; lint and tests are required to pass.
+CI runs the same commands on every PR via `.github/workflows/ci.yml`. Lint (`ruff check` + `ruff format --check`) and tests must pass; mypy is advisory.
 
 ## License
 

@@ -61,6 +61,10 @@ export MEMTOMEM_STM_SURFACING__MAX_RESULTS=3
 export MEMTOMEM_STM_SURFACING__MIN_RESPONSE_CHARS=5000
 export MEMTOMEM_STM_SURFACING__FEEDBACK_ENABLED=true
 export MEMTOMEM_STM_SURFACING__AUTO_TUNE_ENABLED=true
+export MEMTOMEM_STM_SURFACING__CONTEXT_WINDOW_SIZE=0       # 0=disabled; >0 expands ±N adjacent chunks
+export MEMTOMEM_STM_SURFACING__CONSUMER_MODEL=claude-sonnet-4  # auto-scales max_results + max_injection_chars
+export MEMTOMEM_STM_SURFACING__DEDUP_TTL_SECONDS=604800    # 7 days; 0 to disable cross-session dedup
+export MEMTOMEM_STM_SURFACING__FEEDBACK_DB_PATH=~/.memtomem/stm_feedback.db
 
 # LTM connection (defaults shown)
 export MEMTOMEM_STM_SURFACING__LTM_MCP_COMMAND=memtomem-server
@@ -161,6 +165,7 @@ Full example with all options:
   },
   "cache": {
     "enabled": true,
+    "db_path": "~/.memtomem/proxy_cache.db",
     "default_ttl_seconds": 3600,
     "max_entries": 10000
   },

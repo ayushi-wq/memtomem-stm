@@ -45,7 +45,7 @@ class LLMProvider(StrEnum):
 
 class LLMCompressorConfig(BaseModel):
     provider: LLMProvider = LLMProvider.OPENAI
-    model: str = "gpt-4o-mini"
+    model: str = "gpt-4.1-mini"
     api_key: str = ""
     base_url: str = ""
     system_prompt: str = (
