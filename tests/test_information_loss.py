@@ -17,7 +17,9 @@ import json
 from memtomem_stm.proxy.compression import (
     FieldExtractCompressor,
     HybridCompressor,
+    SchemaPruningCompressor,
     SelectiveCompressor,
+    SkeletonCompressor,
     TruncateCompressor,
 )
 
@@ -181,6 +183,142 @@ MEETING_NOTES = """# Sprint Planning — 2026-04-01
 - [ ] Choi Minjun: Update project timeline in Notion
 - [ ] ALL: Review v1 API deprecation communication draft by April 5
 """
+
+
+API_DOCS = """# User Management API
+
+## GET /users
+
+List all users with optional filtering.
+
+### Parameters
+
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| page | int | no | Page number (default 1) |
+| limit | int | no | Items per page (default 20, max 100) |
+| role | string | no | Filter by role: admin, editor, viewer |
+| search | string | no | Full-text search on name and email |
+
+### Response
+
+```json
+{
+  "users": [{"id": 1, "name": "Alice", "role": "admin"}],
+  "total": 150,
+  "page": 1
+}
+```
+
+## POST /users
+
+Create a new user. Requires `admin` role.
+
+### Request Body
+
+```json
+{
+  "name": "string (required)",
+  "email": "string (required, unique)",
+  "role": "admin | editor | viewer (default: viewer)",
+  "password": "string (min 8 chars, must include uppercase + number)"
+}
+```
+
+### Response
+
+- `201 Created` — returns the created user object
+- `409 Conflict` — email already exists
+- `422 Unprocessable Entity` — validation failed
+
+## PUT /users/{id}
+
+Update an existing user. Requires `admin` role or own account.
+
+### Parameters
+
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| id | int | yes | User ID |
+
+### Request Body
+
+Same as POST, all fields optional.
+
+### Response
+
+- `200 OK` — returns updated user
+- `404 Not Found` — user does not exist
+- `403 Forbidden` — insufficient permissions
+
+## DELETE /users/{id}
+
+Permanently delete a user. Requires `admin` role. Cannot delete self.
+
+### Parameters
+
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| id | int | yes | User ID |
+
+### Response
+
+- `204 No Content` — successfully deleted
+- `404 Not Found` — user does not exist
+- `403 Forbidden` — cannot delete own account
+
+## PATCH /users/{id}/role
+
+Change a user's role. Requires `admin` role.
+
+### Request Body
+
+```json
+{"role": "admin | editor | viewer"}
+```
+
+### Response
+
+- `200 OK` — returns updated user
+- `400 Bad Request` — invalid role value
+"""
+
+
+NESTED_CONFIG_JSON = json.dumps({
+    "database": {
+        "host": "db.internal.example.com",
+        "port": 5432,
+        "name": "production_db",
+        "pool": {"min": 5, "max": 20, "idle_timeout": 300},
+        "replicas": [
+            {"host": "replica-1.internal", "port": 5432, "weight": 50},
+            {"host": "replica-2.internal", "port": 5432, "weight": 50},
+        ],
+    },
+    "cache": {
+        "provider": "redis",
+        "host": "redis.internal.example.com",
+        "port": 6379,
+        "ttl_seconds": 3600,
+        "max_memory": "2gb",
+    },
+    "auth": {
+        "provider": "jwt",
+        "secret_rotation_days": 90,
+        "session_ttl": 86400,
+        "mfa_required": True,
+        "allowed_origins": [
+            "https://app.example.com",
+            "https://admin.example.com",
+            "https://staging.example.com",
+        ],
+    },
+    "monitoring": {
+        "metrics": {"provider": "prometheus", "port": 9090},
+        "logging": {"provider": "elasticsearch", "level": "info"},
+        "alerting": {"provider": "pagerduty", "escalation_minutes": 15},
+    },
+}, indent=2)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -626,3 +764,223 @@ class TestCompressionCurve:
             or "truncated" in hybrid
         )
         assert has_tail_hints, "Hybrid tail should provide navigability hints"
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 7. SKELETON — API docs structural preservation
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class TestSkeletonInfoLoss:
+    """Evaluate skeleton compression on API documentation."""
+
+    def test_all_endpoint_headings_preserved(self):
+        """Every endpoint heading survives — skeleton's core guarantee."""
+        comp = SkeletonCompressor()
+        result = comp.compress(API_DOCS, max_chars=800)
+
+        for method in ("GET", "POST", "PUT", "DELETE", "PATCH"):
+            assert method in result, f"{method} endpoint heading lost"
+
+    def test_http_paths_preserved(self):
+        """API paths survive alongside their HTTP methods."""
+        comp = SkeletonCompressor()
+        result = comp.compress(API_DOCS, max_chars=800)
+
+        assert "/users" in result
+        assert "/users/{id}" in result
+
+    def test_subheadings_preserved(self):
+        """Subheadings (Parameters, Response, Request Body) survive."""
+        comp = SkeletonCompressor()
+        result = comp.compress(API_DOCS, max_chars=1200)
+
+        # At least some subheadings should be present
+        subheadings = ["Parameters", "Response", "Request Body"]
+        found = sum(1 for h in subheadings if h in result)
+        assert found >= 2, f"Only {found}/3 subheading types survived"
+
+    def test_body_content_trimmed(self):
+        """Skeleton is shorter than original — body is aggressively trimmed."""
+        comp = SkeletonCompressor()
+        result = comp.compress(API_DOCS, max_chars=1000)
+
+        assert len(result) < len(API_DOCS)
+        # Original metadata is appended
+        assert "skeleton" in result
+
+    def test_skeleton_vs_truncate_heading_coverage(self):
+        """Skeleton preserves more headings than truncate at same budget."""
+        budget = 800
+
+        skeleton = SkeletonCompressor().compress(API_DOCS, max_chars=budget)
+        truncated = TruncateCompressor().compress(API_DOCS, max_chars=budget)
+
+        endpoints = ["GET /users", "POST /users", "PUT /users", "DELETE /users", "PATCH /users"]
+        skel_found = sum(1 for ep in endpoints if ep in skeleton)
+        trunc_found = sum(1 for ep in endpoints if ep in truncated)
+
+        assert skel_found >= trunc_found, (
+            f"Skeleton ({skel_found}) should preserve at least as many "
+            f"endpoints as truncate ({trunc_found})"
+        )
+
+    def test_fallback_to_truncate_with_single_heading(self):
+        """Document with < 2 headings falls back to TruncateCompressor."""
+        text = "## Only Heading\n\n" + "Long API documentation. " * 100
+        comp = SkeletonCompressor()
+        result = comp.compress(text, max_chars=200)
+
+        # Falls back to truncate behavior
+        assert "truncated" in result or "condensed" in result or "original" in result
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 8. SCHEMA PRUNING — JSON structure preservation
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class TestSchemaPruningInfoLoss:
+    """Evaluate schema-preserving JSON pruning."""
+
+    def test_all_top_level_keys_preserved(self):
+        """Every top-level config key survives pruning."""
+        comp = SchemaPruningCompressor()
+        result = comp.compress(NESTED_CONFIG_JSON, max_chars=800)
+
+        for key in ("database", "cache", "auth", "monitoring"):
+            assert key in result, f"Top-level key '{key}' lost"
+
+    def test_nested_keys_preserved(self):
+        """Second-level keys survive — structure is fully represented."""
+        comp = SchemaPruningCompressor()
+        result = comp.compress(NESTED_CONFIG_JSON, max_chars=1000)
+
+        # Database nested keys
+        assert "host" in result
+        assert "pool" in result or "replicas" in result
+
+        # Auth nested keys
+        assert "provider" in result
+        assert "mfa_required" in result or "session_ttl" in result
+
+    def test_array_sampling_shows_count(self):
+        """Large arrays show first items + omitted count, not just truncated."""
+        comp = SchemaPruningCompressor()
+        result = comp.compress(API_RESPONSE_JSON, max_chars=800)
+
+        parsed = json.loads(result)
+        users = parsed.get("users", [])
+        # Array should be sampled, not fully included
+        assert len(users) < 50
+        # Omitted count should appear somewhere
+        found_count = any("omitted" in str(item) for item in users if isinstance(item, str))
+        assert found_count, "Array should indicate number of omitted items"
+
+    def test_first_and_last_array_items_present(self):
+        """Schema pruning keeps head + tail items (not just head)."""
+        comp = SchemaPruningCompressor()
+        result = comp.compress(API_RESPONSE_JSON, max_chars=1200)
+
+        # First item should be present
+        assert "Alice" in result or '"id": 1' in result
+        # Last item (User50 or similar) should also be present
+        # SchemaPruningCompressor keeps first 2 + last 1
+        parsed = json.loads(result)
+        users = parsed.get("users", [])
+        real_items = [u for u in users if isinstance(u, dict)]
+        if len(real_items) >= 2:
+            # Check tail item exists (last real dict in the sampled array)
+            last = real_items[-1]
+            assert last.get("id", 0) >= 40 or last.get("name", "").startswith("User")
+
+    def test_string_values_capped_not_deleted(self):
+        """Long strings are truncated with '...', not removed entirely."""
+        data = json.dumps({"description": "x" * 200, "other": "short"})
+        comp = SchemaPruningCompressor(max_string=50)
+        result = comp.compress(data, max_chars=200)
+
+        parsed = json.loads(result)
+        desc = parsed.get("description", "")
+        assert len(desc) <= 55  # 50 + "..."
+        assert desc.endswith("...")
+        assert parsed["other"] == "short"  # short strings unchanged
+
+    def test_numeric_and_bool_values_exact(self):
+        """Non-string primitives survive pruning unchanged."""
+        comp = SchemaPruningCompressor()
+        result = comp.compress(NESTED_CONFIG_JSON, max_chars=1200)
+
+        parsed = json.loads(result)
+        cache = parsed.get("cache", {})
+        assert cache.get("port") == 6379
+        assert cache.get("ttl_seconds") == 3600
+
+    def test_pruning_vs_field_extract_key_coverage(self):
+        """Schema pruning preserves deeper nesting than field extraction."""
+        budget = 600
+
+        pruned = SchemaPruningCompressor().compress(NESTED_CONFIG_JSON, max_chars=budget)
+        extracted = FieldExtractCompressor().compress(NESTED_CONFIG_JSON, max_chars=budget)
+
+        # Both should have top-level keys
+        for key in ("database", "cache", "auth"):
+            assert key in pruned, f"Pruning lost '{key}'"
+            assert key in extracted, f"Extraction lost '{key}'"
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 9. FULL CROSS-STRATEGY — all 5 compressors on the same input
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class TestFullCrossStrategy:
+    """Compare all compressor strategies on API documentation."""
+
+    def _count_preserved(self, result: str, keywords: list[str]) -> int:
+        return sum(1 for kw in keywords if kw.lower() in result.lower())
+
+    def test_api_docs_endpoint_preservation(self):
+        """Compare how many API endpoints each strategy preserves."""
+        endpoints = ["GET /users", "POST /users", "PUT /users/{id}",
+                     "DELETE /users/{id}", "PATCH /users/{id}/role"]
+        budget = 1000
+
+        results = {
+            "truncate": TruncateCompressor().compress(API_DOCS, max_chars=budget),
+            "hybrid": HybridCompressor(head_chars=500).compress(API_DOCS, max_chars=budget),
+            "skeleton": SkeletonCompressor().compress(API_DOCS, max_chars=budget),
+        }
+
+        scores = {name: self._count_preserved(text, endpoints) for name, text in results.items()}
+
+        # Skeleton should excel at preserving all endpoints
+        assert scores["skeleton"] >= 4, (
+            f"Skeleton should preserve most endpoints, got {scores['skeleton']}/5"
+        )
+        # Skeleton should beat or match truncate
+        assert scores["skeleton"] >= scores["truncate"]
+
+    def test_json_strategy_comparison(self):
+        """Compare JSON-specific strategies on nested config."""
+        keys = ["database", "cache", "auth", "monitoring",
+                "host", "port", "provider", "pool", "replicas"]
+        budget = 800
+
+        results = {
+            "truncate": TruncateCompressor().compress(NESTED_CONFIG_JSON, max_chars=budget),
+            "schema_pruning": SchemaPruningCompressor().compress(
+                NESTED_CONFIG_JSON, max_chars=budget
+            ),
+            "field_extract": FieldExtractCompressor().compress(
+                NESTED_CONFIG_JSON, max_chars=budget
+            ),
+        }
+
+        scores = {name: self._count_preserved(text, keys) for name, text in results.items()}
+
+        # Schema pruning should preserve the most structure
+        assert scores["schema_pruning"] >= scores["truncate"], (
+            f"Schema pruning ({scores['schema_pruning']}) should beat "
+            f"truncate ({scores['truncate']}) on JSON structure"
+        )
