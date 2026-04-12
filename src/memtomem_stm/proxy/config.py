@@ -156,6 +156,14 @@ class ProgressiveConfig(BaseModel):
 class ToolOverrideConfig(BaseModel):
     compression: CompressionStrategy | None = None
     max_result_chars: int | None = Field(default=None, gt=0)
+    retention_floor: float | None = Field(default=None, ge=0.0, le=1.0)
+    """Override the dynamic retention floor for this tool.
+
+    When set, the ratio guard uses this value instead of the global
+    size-based scaling (<1KB→0.9, <3KB→0.75, etc.).  Useful for tools
+    whose responses tolerate more aggressive compression or, conversely,
+    for tools where even small losses are costly.
+    """
     llm: LLMCompressorConfig | None = None
     selective: SelectiveConfig | None = None
     hybrid: HybridConfig | None = None
@@ -177,6 +185,8 @@ class UpstreamServerConfig(BaseModel):
     headers: dict[str, str] | None = None
     compression: CompressionStrategy = CompressionStrategy.AUTO
     max_result_chars: int = Field(default=8000, gt=0)
+    retention_floor: float | None = Field(default=None, ge=0.0, le=1.0)
+    """Per-server retention floor override (see ToolOverrideConfig)."""
     llm: LLMCompressorConfig | None = None
     selective: SelectiveConfig | None = None
     hybrid: HybridConfig | None = None

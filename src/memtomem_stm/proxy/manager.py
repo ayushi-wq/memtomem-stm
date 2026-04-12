@@ -83,6 +83,7 @@ class ToolConfig:
     hybrid: HybridConfig | None
     extraction_enabled: bool = False
     progressive: ProgressiveConfig | None = None
+    retention_floor: float | None = None
 
 
 @dataclass
@@ -427,6 +428,7 @@ class ProxyManager:
             extraction_enabled = cfg.extraction
 
         progressive_cfg = cfg.progressive
+        retention_floor = cfg.retention_floor
 
         override = cfg.tool_overrides.get(tool)
         if override is not None:
@@ -434,6 +436,8 @@ class ProxyManager:
                 compression = override.compression
             if override.max_result_chars is not None:
                 max_chars = override.max_result_chars
+            if override.retention_floor is not None:
+                retention_floor = override.retention_floor
             if override.llm is not None:
                 llm_cfg = override.llm
             if override.selective is not None:
@@ -459,6 +463,7 @@ class ProxyManager:
             hybrid=hybrid_cfg,
             extraction_enabled=extraction_enabled,
             progressive=progressive_cfg,
+            retention_floor=retention_floor,
         )
 
     def _clean_content(self, text: str, cleaning_cfg: CleaningConfig) -> str:
@@ -1047,8 +1052,10 @@ class ProxyManager:
             dynamic = 0.0  # effective retention floor applied to this call (0 = unset)
             if min_retention > 0:
                 n = len(cleaned)
-                # Scale: short content (< 1KB) gets ~90% retention, large (10KB+) gets base
-                if n < 1000:
+                if tc.retention_floor is not None:
+                    # Per-tool override from config (set by operator or auto-tuner).
+                    dynamic = tc.retention_floor
+                elif n < 1000:
                     dynamic = max(min_retention, 0.9)
                 elif n < 3000:
                     dynamic = max(min_retention, 0.75)
@@ -1109,6 +1116,7 @@ class ProxyManager:
                     else:
                         original_strategy = effective_compression.value
                         pcfg = tc.progressive or ProgressiveConfig()
+                        hybrid_fallback = False
                         # Tier 1: progressive (zero-loss, best-effort).
                         # Skip when content fits in a single chunk —
                         # progressive adds footer overhead without benefit
@@ -1131,14 +1139,51 @@ class ProxyManager:
                             except Exception:
                                 logger.debug(
                                     "Progressive fallback failed for %s/%s, "
-                                    "falling through to truncate",
+                                    "falling through to hybrid/truncate",
                                     server,
                                     tool,
                                     exc_info=True,
                                 )
-                        # Tier 2: truncate (guaranteed floor) — also the
-                        # direct path when content is too small for progressive.
+                        # Tier 2: hybrid (structure-preserving, best-effort).
+                        # Fires when progressive didn't run or failed, AND the
+                        # content has enough heading structure for head+TOC to
+                        # be meaningful.  Minimum 3 headings — below that,
+                        # truncate loses little structural information.
+                        _MIN_HEADINGS_FOR_HYBRID = 3
                         if not progressive_fallback:
+                            heading_count = cleaned.count("\n#")
+                            if heading_count >= _MIN_HEADINGS_FOR_HYBRID:
+                                try:
+                                    compressed = await self._apply_hybrid(
+                                        cleaned,
+                                        effective_max_chars,
+                                        tc.hybrid,
+                                        tc.selective,
+                                        context_query=context_query,
+                                    )
+                                    if len(compressed) / cleaned_len >= dynamic:
+                                        metrics_strategy = f"{original_strategy}→hybrid_fallback"
+                                        hybrid_fallback = True
+                                        logger.info(
+                                            "Hybrid fallback for %s/%s: %s (ratio %.3f→%.3f)",
+                                            server,
+                                            tool,
+                                            metrics_strategy,
+                                            compressed_ratio,
+                                            len(compressed) / cleaned_len,
+                                        )
+                                except Exception:
+                                    logger.debug(
+                                        "Hybrid fallback failed for %s/%s, "
+                                        "falling through to truncate",
+                                        server,
+                                        tool,
+                                        exc_info=True,
+                                    )
+                        # Tier 3: truncate (guaranteed floor) — also the
+                        # direct path when content is too small for progressive
+                        # and lacks structure for hybrid.
+                        if not progressive_fallback and not hybrid_fallback:
                             compressed = TruncateCompressor(scorer=self._relevance_scorer).compress(
                                 cleaned, max_chars=effective_max_chars
                             )
