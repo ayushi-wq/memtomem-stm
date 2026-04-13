@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import re
 from contextlib import AsyncExitStack
@@ -96,15 +97,41 @@ class CompactResultParser(ResultParser):
 
 
 class StructuredResultParser(ResultParser):
-    """Parse core's future structured JSON format (Phase 2).
+    """Parse core's structured JSON format: ``{"results": [...]}``.
 
-    Not yet implemented — core has not shipped ``format="structured"``
-    support. Calling ``parse()`` raises ``NotImplementedError`` to mark
-    the Phase 2 boundary clearly in tests.
+    Each element contains ``rank``, ``score``, ``source``, ``hierarchy``,
+    ``namespace``, ``chunk_id``, and ``content`` fields.
     """
 
     def parse(self, text: str) -> list[RemoteSearchResult]:
-        raise NotImplementedError("Structured format parser is not yet implemented (Phase 2)")
+        if not text or not text.strip():
+            return []
+
+        try:
+            data = json.loads(text)
+        except (json.JSONDecodeError, TypeError):
+            logger.warning("StructuredResultParser: invalid JSON, falling back to empty")
+            return []
+
+        raw_results = data.get("results", [])
+        results: list[RemoteSearchResult] = []
+        for item in raw_results:
+            content = item.get("content", "")
+            if not content:
+                continue
+            result = RemoteSearchResult(
+                content=content[:500],
+                score=float(item.get("score", 0.0)),
+                source=item.get("source", "unknown"),
+                namespace=item.get("namespace", "default"),
+            )
+            # Preserve chunk_id from core instead of sha256(content)
+            chunk_id = item.get("chunk_id")
+            if chunk_id:
+                result.chunk.id = chunk_id
+            results.append(result)
+
+        return results
 
 
 def get_parser(fmt: str = "compact") -> ResultParser:
@@ -186,6 +213,8 @@ class McpClientSearchAdapter:
             args["context_window"] = context_window
         if trace_id is not None:
             args["_trace_id"] = trace_id
+        if isinstance(self._parser, StructuredResultParser):
+            args["output_format"] = "structured"
 
         try:
             result = await self._session.call_tool("mem_search", args)

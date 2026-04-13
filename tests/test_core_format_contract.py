@@ -263,13 +263,13 @@ class TestParserStrategy:
                 assert s.score == st.score
                 assert s.chunk.content == st.chunk.content
 
-    def test_structured_parser_not_implemented(self):
-        """StructuredResultParser.parse() raises NotImplementedError (Phase 2 boundary)."""
+    def test_structured_parser_returns_empty_for_invalid_json(self):
+        """StructuredResultParser.parse() returns [] for non-JSON input."""
         from memtomem_stm.surfacing.mcp_client import StructuredResultParser
 
         parser = StructuredResultParser()
-        with pytest.raises(NotImplementedError, match="Phase 2"):
-            parser.parse("any text")
+        assert parser.parse("not json") == []
+        assert parser.parse("") == []
 
     def test_adapter_uses_configured_parser(self):
         """McpClientSearchAdapter respects config.result_format."""
@@ -292,9 +292,8 @@ STRUCTURED_TWO_RESULTS = (
 
 
 class TestStructuredFormatSnapshots:
-    """Forward-looking snapshots for Phase 2 structured format."""
+    """Verify StructuredResultParser handles core's structured JSON format."""
 
-    @pytest.mark.xfail(reason="Phase 2 not implemented", strict=True)
     def test_structured_two_results(self):
         from memtomem_stm.surfacing.mcp_client import StructuredResultParser
 
@@ -303,3 +302,48 @@ class TestStructuredFormatSnapshots:
         assert len(results) == 2
         assert results[0].score == pytest.approx(0.92)
         assert results[1].score == pytest.approx(0.87)
+        assert "auth.md" in str(results[0].chunk.metadata.source_file)
+        assert "api.md" in str(results[1].chunk.metadata.source_file)
+        assert results[0].chunk.metadata.namespace == "default"
+        assert results[0].chunk.id == "abc123"
+        assert results[1].chunk.id == "def456"
+
+
+class TestOutputFormatForwarding:
+    """Verify output_format is sent to MCP when using structured parser."""
+
+    @pytest.mark.asyncio
+    async def test_structured_parser_sends_output_format(self):
+        from unittest.mock import AsyncMock, MagicMock
+
+        from memtomem_stm.surfacing.mcp_client import McpClientSearchAdapter
+
+        adapter = McpClientSearchAdapter(SurfacingConfig(result_format="structured"))
+        mock_session = AsyncMock()
+        mock_result = MagicMock()
+        mock_result.content = []
+        mock_session.call_tool = AsyncMock(return_value=mock_result)
+        adapter._session = mock_session
+
+        await adapter.search("test query")
+
+        call_args = mock_session.call_tool.call_args
+        assert call_args[0][1]["output_format"] == "structured"
+
+    @pytest.mark.asyncio
+    async def test_compact_parser_does_not_send_output_format(self):
+        from unittest.mock import AsyncMock, MagicMock
+
+        from memtomem_stm.surfacing.mcp_client import McpClientSearchAdapter
+
+        adapter = McpClientSearchAdapter(SurfacingConfig(result_format="compact"))
+        mock_session = AsyncMock()
+        mock_result = MagicMock()
+        mock_result.content = []
+        mock_session.call_tool = AsyncMock(return_value=mock_result)
+        adapter._session = mock_session
+
+        await adapter.search("test query")
+
+        call_args = mock_session.call_tool.call_args
+        assert "output_format" not in call_args[0][1]
