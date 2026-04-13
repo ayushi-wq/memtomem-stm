@@ -8,7 +8,6 @@ import time as _time
 import uuid
 from contextlib import AsyncExitStack
 from dataclasses import dataclass
-from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -40,11 +39,16 @@ from memtomem_stm.proxy.config import (
     ProxyConfig,
     ProxyConfigLoader,
     SelectiveConfig,
-    TailMode,
     TransportType,
     UpstreamServerConfig,
 )
-from memtomem_stm.proxy.extraction import ExtractedFact, FactExtractor
+from memtomem_stm.proxy.extraction import FactExtractor
+from memtomem_stm.proxy.memory_ops import auto_index_response, extract_and_store, format_fact_md
+from memtomem_stm.proxy.tool_metadata import (
+    convention_suffix,
+    distill_schema,
+    truncate_description,
+)
 from memtomem_stm.proxy.progressive import (
     ProgressiveChunker,
     ProgressiveResponse,
@@ -254,61 +258,10 @@ class ProxyManager:
     def _config(self) -> ProxyConfig:
         return self._config_loader.get()
 
-    @staticmethod
-    def _truncate_description(desc: str, max_chars: int) -> str:
-        """Truncate description at sentence boundary within budget."""
-        if not desc or len(desc) <= max_chars:
-            return desc
-        # Try to cut at last sentence boundary
-        truncated = desc[:max_chars]
-        for sep in (". ", ".\n", "! ", "? "):
-            idx = truncated.rfind(sep)
-            if idx > max_chars // 3:  # don't cut too early
-                return truncated[: idx + 1].rstrip()
-        # Fall back to word boundary
-        idx = truncated.rfind(" ")
-        if idx > max_chars // 3:
-            return truncated[:idx] + "..."
-        return truncated + "..."
-
-    @staticmethod
-    def _distill_schema(schema: dict, strip_descriptions: bool) -> dict:
-        """Remove description/examples from schema properties to save tokens."""
-        if not strip_descriptions or not isinstance(schema, dict):
-            return schema
-        result: dict[str, Any] = {}
-        for k, v in schema.items():
-            if k in ("description", "examples"):
-                continue
-            if isinstance(v, dict):
-                result[k] = ProxyManager._distill_schema(v, strip_descriptions)
-            elif isinstance(v, list):
-                result[k] = [
-                    ProxyManager._distill_schema(item, True) if isinstance(item, dict) else item
-                    for item in v
-                ]
-            else:
-                result[k] = v
-        return result
-
-    @staticmethod
-    def _convention_suffix(
-        compression: CompressionStrategy,
-        hybrid_cfg: HybridConfig | None,
-    ) -> str:
-        """Return a convention hint for strategies that change agent interaction.
-
-        Returns empty string for strategies that produce standard text responses.
-        """
-        if compression == CompressionStrategy.SELECTIVE:
-            return " | TOC response: use stm_proxy_select_chunks"
-        if compression == CompressionStrategy.PROGRESSIVE:
-            return " | Chunked: use stm_proxy_read_more for more"
-        if compression == CompressionStrategy.HYBRID:
-            cfg = hybrid_cfg or HybridConfig()
-            if cfg.tail_mode == TailMode.TOC:
-                return " | Head+TOC: use stm_proxy_select_chunks"
-        return ""
+    # Delegates to proxy.tool_metadata module (backward-compatible)
+    _truncate_description = staticmethod(truncate_description)
+    _distill_schema = staticmethod(distill_schema)
+    _convention_suffix = staticmethod(convention_suffix)
 
     def get_proxy_tools(self) -> list[ProxyToolInfo]:
         result: list[ProxyToolInfo] = []
@@ -605,59 +558,18 @@ class ProxyManager:
     ) -> str:
         if self._index_engine is None:
             raise RuntimeError("index_engine not available")
-
-        ai_cfg = self._config.auto_index
-        memory_dir = ai_cfg.memory_dir.expanduser().resolve()
-        memory_dir.mkdir(parents=True, exist_ok=True)
-
-        ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%f")
-        safe_tool = tool.replace("/", "_")
-        fname = f"{server}__{safe_tool}__{ts}.md"
-        file_path = memory_dir / fname
-
-        args_str = ", ".join(f"{k}={v!r}" for k, v in arguments.items()) if arguments else "(none)"
-
-        frontmatter_lines = [
-            "---",
-            f"source: proxy/{server}/{tool}",
-            f"timestamp: {datetime.now(timezone.utc).isoformat()}",
-        ]
-        if compression_strategy is not None:
-            frontmatter_lines.append(f"compression: {compression_strategy}")
-        if original_chars is not None:
-            frontmatter_lines.append(f"original_chars: {original_chars}")
-        if compressed_chars is not None:
-            frontmatter_lines.append(f"compressed_chars: {compressed_chars}")
-        frontmatter_lines.append("---")
-
-        intent_section = ""
-        if context_query:
-            intent_section = f"## Agent Intent\n\n> {context_query}\n\n"
-
-        md_content = (
-            f"{chr(10).join(frontmatter_lines)}\n\n"
-            f"# Proxy Response: {server}/{tool}\n\n"
-            f"- **Source**: `{server}/{tool}({args_str})`\n"
-            f"- **Original size**: {original_chars or len(text)} chars\n\n"
-            f"{intent_section}"
-            f"## Content\n\n{text}\n"
-        )
-        file_path.write_text(md_content, encoding="utf-8")
-
-        ns = ai_cfg.namespace.format(server=server, tool=tool)
-
-        try:
-            stats = await self._index_engine.index_file(file_path, namespace=ns)
-            chunks = stats.indexed_chunks
-        except Exception as exc:
-            logger.warning("Auto-index failed for %s/%s: %s", server, tool, exc)
-            chunks = 0
-
-        return (
-            f"[Indexed] `{server}/{tool}` ({original_chars or len(text)}"
-            f"→{compressed_chars or len(agent_summary)} chars) "
-            f"· {chunks} chunks in `{ns}` namespace.\n\n"
-            f"{agent_summary}"
+        return await auto_index_response(
+            index_engine=self._index_engine,
+            ai_cfg=self._config.auto_index,
+            server=server,
+            tool=tool,
+            arguments=arguments,
+            text=text,
+            agent_summary=agent_summary,
+            compression_strategy=compression_strategy,
+            original_chars=original_chars,
+            compressed_chars=compressed_chars,
+            context_query=context_query,
         )
 
     async def _get_extractor(self) -> FactExtractor:
@@ -676,90 +588,20 @@ class ProxyManager:
         context_query: str | None = None,
     ) -> None:
         """Extract facts from response and store as individual memory entries."""
-        try:
-            ext_cfg = self._config.extraction
-            extractor = await self._get_extractor()
-            facts = await extractor.extract(text, server=server, tool=tool)
-            if not facts:
-                return
+        extractor = await self._get_extractor()
+        await extract_and_store(
+            index_engine=self._index_engine,
+            extractor=extractor,
+            ext_cfg=self._config.extraction,
+            server=server,
+            tool=tool,
+            arguments=arguments,
+            text=text,
+            context_query=context_query,
+        )
 
-            memory_dir = ext_cfg.memory_dir.expanduser().resolve()
-            memory_dir.mkdir(parents=True, exist_ok=True)
-            ns = ext_cfg.namespace.format(server=server, tool=tool)
-
-            # Dedup: skip facts already in the index
-            dedup = ext_cfg.dedup_threshold > 0 and hasattr(self._index_engine, "is_duplicate")
-
-            ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%f")
-            safe_tool = tool.replace("/", "_")
-            indexed_count = 0
-
-            for i, fact in enumerate(facts[: ext_cfg.max_facts]):
-                if dedup and self._index_engine is not None:
-                    try:
-                        is_dup = await self._index_engine.is_duplicate(
-                            fact.content,
-                            namespace=ns,
-                            threshold=ext_cfg.dedup_threshold,
-                        )
-                        if is_dup:
-                            logger.debug("Skipping duplicate fact: %s", fact.content[:60])
-                            continue
-                    except Exception:
-                        pass  # on dedup failure, proceed with indexing
-
-                fname = f"{server}__{safe_tool}__fact__{ts}__{i:02d}.md"
-                file_path = memory_dir / fname
-                md_content = self._format_fact_md(fact, server, tool, arguments)
-                file_path.write_text(md_content, encoding="utf-8")
-
-                if self._index_engine is None:
-                    continue
-                try:
-                    await self._index_engine.index_file(file_path, namespace=ns)
-                    indexed_count += 1
-                except Exception as exc:
-                    logger.warning("Fact indexing failed: %s", exc)
-
-            if indexed_count:
-                logger.info(
-                    "Extracted %d facts from %s/%s into namespace '%s'",
-                    indexed_count,
-                    server,
-                    tool,
-                    ns,
-                )
-        except Exception:
-            logger.warning("Fact extraction failed for %s/%s", server, tool, exc_info=True)
-
-    @staticmethod
-    def _format_fact_md(
-        fact: ExtractedFact,
-        server: str,
-        tool: str,
-        arguments: dict[str, Any],
-    ) -> str:
-        tags_str = ", ".join(fact.tags) if fact.tags else ""
-        args_str = ", ".join(f"{k}={v!r}" for k, v in arguments.items()) if arguments else "(none)"
-        title = fact.content[:80].rstrip(".")
-        lines = [
-            "---",
-            f"source: extracted/{server}/{tool}",
-            f"timestamp: {datetime.now(timezone.utc).isoformat()}",
-            f"category: {fact.category}",
-            f"confidence: {fact.confidence}",
-            "---",
-            "",
-            f"## {title}",
-            "",
-            fact.content,
-            "",
-        ]
-        if tags_str:
-            lines.append(f"tags: [{tags_str}]")
-        lines.append(f"extracted_from: {server}/{tool}({args_str})")
-        lines.append("")
-        return "\n".join(lines)
+    # Backward-compatible delegate
+    _format_fact_md = staticmethod(format_fact_md)
 
     def select_chunks(self, key: str, sections: list[str]) -> str:
         if self._selective_compressor is None:
