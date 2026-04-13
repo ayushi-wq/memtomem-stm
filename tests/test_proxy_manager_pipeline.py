@@ -190,7 +190,8 @@ class TestApplySurfacing:
 
         assert result == "surfaced text"
         mock_engine.surface.assert_awaited_once_with(
-            server="srv", tool="t", arguments={"q": "x"}, response_text="original"
+            server="srv", tool="t", arguments={"q": "x"}, response_text="original",
+            trace_id=None,
         )
 
     async def test_engine_failure_returns_original(self, tmp_path, caplog):

@@ -500,6 +500,8 @@ class ProxyManager:
         tool: str,
         arguments: dict[str, Any],
         text: str,
+        *,
+        trace_id: str | None = None,
     ) -> str:
         """Apply proactive memory surfacing if eligible."""
         if self._surfacing_engine is None:
@@ -510,6 +512,7 @@ class ProxyManager:
                 tool=tool,
                 arguments=arguments,
                 response_text=text,
+                trace_id=trace_id,
             )
         except Exception:
             logger.warning(
@@ -717,7 +720,9 @@ class ProxyManager:
                     "proxy_call_cache_hit",
                     metadata={"server": server, "tool": tool},
                 ):
-                    cached = await self._apply_surfacing(server, tool, arguments, cached)
+                    cached = await self._apply_surfacing(
+                        server, tool, arguments, cached, trace_id=trace_id
+                    )
                 return cached
             self.tracker.record_cache_miss()
 
@@ -1076,7 +1081,9 @@ class ProxyManager:
                     metadata={"server": server, "tool": tool},
                 ):
                     _t0 = _time.monotonic()
-                    surfaced = await self._apply_surfacing(server, tool, upstream_args, compressed)
+                    surfaced = await self._apply_surfacing(
+                        server, tool, upstream_args, compressed, trace_id=trace_id
+                    )
                     _surface_ms = (_time.monotonic() - _t0) * 1000
 
         # ── Stage 4: INDEX (optional) ──

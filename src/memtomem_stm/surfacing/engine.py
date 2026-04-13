@@ -82,6 +82,8 @@ class SurfacingEngine:
         tool: str,
         arguments: dict[str, Any],
         response_text: str,
+        *,
+        trace_id: str | None = None,
     ) -> str:
         """Surface relevant memories and inject into response_text.
 
@@ -113,7 +115,7 @@ class SurfacingEngine:
 
         try:
             result = await asyncio.wait_for(
-                self._do_surface(server, tool, arguments, response_text, query),
+                self._do_surface(server, tool, arguments, response_text, query, trace_id=trace_id),
                 timeout=self._config.timeout_seconds,
             )
             self._circuit_breaker.record_success()
@@ -184,6 +186,8 @@ class SurfacingEngine:
         arguments: dict[str, Any],
         response_text: str,
         query: str,
+        *,
+        trace_id: str | None = None,
     ) -> str:
         # Check surfacing cache (keyed by server+tool+query)
         cache_key = f"{server}/{tool}/{query}"
@@ -223,11 +227,15 @@ class SurfacingEngine:
 
         # Search LTM via remote MCP client
         ctx_win = self._config.context_window_size or None
+        search_kwargs: dict[str, Any] = {}
+        if ctx_win:
+            search_kwargs["context_window"] = ctx_win
         results, _stats = await self._mcp_adapter.search(
             query=query,
             top_k=max_results * 2,
             namespace=namespace,
-            **({"context_window": ctx_win} if ctx_win else {}),
+            trace_id=trace_id,
+            **search_kwargs,
         )
 
         # Filter by score, then exclude already-surfaced memories in this session
@@ -261,7 +269,7 @@ class SurfacingEngine:
         scratch_items: list[dict] | None = None
         if self._config.include_session_context:
             try:
-                scratch_items = await self._mcp_adapter.scratch_list()
+                scratch_items = await self._mcp_adapter.scratch_list(trace_id=trace_id)
             except Exception:
                 logger.debug("Failed to fetch session scratch items", exc_info=True)
                 scratch_items = None
