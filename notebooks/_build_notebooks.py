@@ -1,4 +1,4 @@
-"""Generate the four tutorial notebooks as .ipynb files.
+"""Generate the five tutorial notebooks as .ipynb files.
 
 Run with: ``uv run python notebooks/_build_notebooks.py``
 
@@ -1136,9 +1136,216 @@ def build_nb04() -> None:
     _save(nb, "04_langchain_agent_integration.ipynb")
 
 
+# ---------------------------------------------------------------------------
+# Notebook 05 — Observability and Langfuse Tracing
+# ---------------------------------------------------------------------------
+
+
+def build_nb05() -> None:
+    nb = nbf.v4.new_notebook()
+    nb.cells = [
+        _md(
+            """
+            # 05 — Observability and Langfuse Tracing
+
+            memtomem-stm provides three layers of observability:
+
+            1. **MCP tools** — `stm_proxy_stats`, `stm_proxy_health`,
+               `stm_surfacing_stats` give you an agent-accessible summary
+               of what the proxy is doing.
+            2. **SQLite metrics** — `proxy_metrics.db` and
+               `stm_feedback.db` persist per-call metrics for offline
+               analysis.
+            3. **Langfuse tracing** — optional nested spans that let you
+               visualize the full proxy pipeline in a shared team UI.
+
+            This notebook demonstrates all three layers. Core cells run
+            without any API keys; the live Langfuse cells gate themselves
+            on `_HAS_LANGFUSE_KEY`.
+
+            **Prereqs:** `uv sync` (dev group). Optional:
+            `pip install "memtomem-stm[langfuse]"` plus Langfuse
+            credentials for live tracing.
+            """
+        ),
+        _md("## 1. Isolate state and import helpers"),
+        _code(_BOOTSTRAP),
+        _code(
+            """
+            import os
+            import subprocess
+
+            from _helpers import (
+                isolate_stm_state,
+                stm_session,
+                extract_text,
+                fixtures_dir,
+            )
+
+            config_path = isolate_stm_state(prefix="nb05_")
+            print(f"STM config → {config_path}")
+            """
+        ),
+        _md(
+            """
+            ## 2. Register a fixture server and make a call
+
+            We need proxy calls to generate stats. Let's add the echo
+            fixture and make a quick call.
+            """
+        ),
+        _code(
+            """
+            fixture_script = str(fixtures_dir() / "echo_server.py")
+            subprocess.run(
+                ["mms", "add", "echo", "--command", "uv", "--args",
+                 f"run,python,{fixture_script}", "--prefix", "echo"],
+                check=True,
+                capture_output=True,
+            )
+            print("Registered echo fixture.")
+
+            async with stm_session() as session:
+                result = await session.call_tool("echo__echo", {"text": "hello observability"})
+                print(extract_text(result))
+            """
+        ),
+        _md(
+            """
+            ## 3. Built-in observability: `stm_proxy_stats`
+
+            The simplest way to check what STM is doing — call the
+            `stm_proxy_stats` MCP tool from inside a session.
+            """
+        ),
+        _code(
+            """
+            async with stm_session() as session:
+                stats = await session.call_tool("stm_proxy_stats", {})
+                print(extract_text(stats))
+            """
+        ),
+        _md(
+            """
+            ## 4. Built-in observability: `stm_proxy_health`
+
+            Check upstream connectivity and circuit-breaker state.
+            """
+        ),
+        _code(
+            """
+            async with stm_session() as session:
+                health = await session.call_tool("stm_proxy_health", {})
+                print(extract_text(health))
+            """
+        ),
+        _md(
+            """
+            ## 5. What Langfuse tracing adds
+
+            The MCP tools give you a snapshot; SQLite gives you history.
+            Langfuse adds **live, nested span visualization** across your
+            entire proxy pipeline:
+
+            | Span name | When | Metadata |
+            |---|---|---|
+            | `proxy_call` | Every proxy invocation | `server`, `tool`, `trace_id` |
+            | `proxy_call_clean` | Content cleaning | `server`, `tool` |
+            | `proxy_call_compress` | Compression | `server`, `tool`, `strategy` |
+            | `proxy_call_surface` | Memory injection | `server`, `tool` |
+            | `proxy_call_index` | Auto-indexing | `server`, `tool` |
+            | `stm_surfacing_feedback` | Feedback tool | `surfacing_id`, `rating` |
+            | `stm_surfacing_stats` | Stats query | `tool` |
+
+            Every span is a no-op `nullcontext` when Langfuse is disabled
+            — zero overhead.
+            """
+        ),
+        _md(
+            """
+            ## 6. Enabling Langfuse
+
+            Set these environment variables before starting the STM server:
+
+            ```bash
+            export MEMTOMEM_STM_LANGFUSE__ENABLED=true
+            export MEMTOMEM_STM_LANGFUSE__PUBLIC_KEY=pk-lf-...
+            export MEMTOMEM_STM_LANGFUSE__SECRET_KEY=sk-lf-...
+            export MEMTOMEM_STM_LANGFUSE__HOST=https://cloud.langfuse.com
+            ```
+
+            For self-hosted Langfuse, point `HOST` at `http://localhost:3000`.
+            """
+        ),
+        _code(
+            """
+            _HAS_LANGFUSE_KEY = bool(
+                os.environ.get("LANGFUSE_PUBLIC_KEY")
+                or os.environ.get("MEMTOMEM_STM_LANGFUSE__PUBLIC_KEY")
+            )
+            if _HAS_LANGFUSE_KEY:
+                print("Langfuse credentials detected — live tracing cells will run.")
+            else:
+                print("No Langfuse credentials. Live tracing cells will be skipped.")
+                print("Set MEMTOMEM_STM_LANGFUSE__PUBLIC_KEY to enable.")
+            """
+        ),
+        _md(
+            """
+            ## 7. Sampling configuration
+
+            For high-throughput deployments, trace only a fraction of calls:
+
+            ```bash
+            export MEMTOMEM_STM_LANGFUSE__SAMPLING_RATE=0.1  # trace 10%
+            ```
+
+            Default is `1.0` (trace all). SQLite metrics are always
+            recorded regardless of sampling — they are never skipped.
+            """
+        ),
+        _md(
+            """
+            ## 8. Trace context propagation
+
+            When STM forwards calls to upstream servers, it includes a
+            `_trace_id` field in the tool arguments. Upstream servers can
+            extract this to correlate their own spans with the originating
+            STM trace. The same mechanism works for LTM searches via the
+            `McpClientSearchAdapter`.
+
+            This makes end-to-end distributed tracing possible across the
+            full `agent → STM proxy → upstream server` pipeline.
+            """
+        ),
+        _md(
+            """
+            ## Recap
+
+            | Layer | What you get | When to use |
+            |---|---|---|
+            | MCP tools | Live snapshot, agent-accessible | Quick checks |
+            | SQLite | Full history, offline analysis | Debugging, tuning |
+            | Langfuse | Nested spans, team-shared UI | Production monitoring |
+
+            **Where to next:**
+
+            - [`docs/operations.md`](../docs/operations.md) — full
+              observability reference (span table, data storage, safety)
+            - [`docs/configuration.md`](../docs/configuration.md) — env
+              vars for Langfuse and all other settings
+            - [Langfuse docs](https://langfuse.com/docs) — dashboard
+              setup and SDK reference
+            """
+        ),
+    ]
+    _save(nb, "05_observability_and_langfuse.ipynb")
+
+
 if __name__ == "__main__":
     build_nb00()
     build_nb01()
     build_nb02()
     build_nb03()
     build_nb04()
+    build_nb05()
