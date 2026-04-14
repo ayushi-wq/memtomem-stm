@@ -76,4 +76,3 @@ class CircuitBreaker:
     # Aliases for backward compatibility
     success = record_success
     failure = record_failure
-
