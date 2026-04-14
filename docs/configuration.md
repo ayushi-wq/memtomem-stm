@@ -187,6 +187,7 @@ Full example with all options:
   "auto_index": {
     "enabled": false,
     "min_chars": 2000,
+    "memory_dir": "~/.memtomem/proxy_index",
     "namespace": "proxy-{server}"
   },
   "relevance_scorer": {
@@ -199,9 +200,15 @@ Full example with all options:
   "extraction": {
     "enabled": false,
     "strategy": "llm",
+    "llm": {
+      "provider": "ollama",
+      "model": "qwen3:4b",
+      "base_url": "http://localhost:11434"
+    },
     "max_facts": 10,
     "min_response_chars": 500,
     "dedup_threshold": 0.92,
+    "memory_dir": "~/.memtomem/extracted_facts",
     "namespace": "facts-{server}",
     "background": true,
     "max_input_chars": 20000

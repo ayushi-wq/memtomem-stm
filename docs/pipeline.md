@@ -72,7 +72,7 @@ All upstream tools are exposed with a `{prefix}__{original_name}` naming convent
 
 ## Stage 1: CLEAN
 
-Removes noise from the upstream response before compression. Each step can be toggled per server in `stm_proxy.json`:
+Removes noise from the upstream response before compression. Each step can be toggled per server or per tool (via `tool_overrides`) in `stm_proxy.json`:
 
 - **`<script>` / `<style>` removal** — content and tags fully stripped before other processing
 - **HTML stripping** — removes tags (preserves code fences and generic types like `List<String>`)
@@ -83,6 +83,7 @@ Removes noise from the upstream response before compression. Each step can be to
 ```json
 {
   "cleaning": {
+    "enabled": true,
     "strip_html": true,
     "deduplicate": true,
     "collapse_links": true
