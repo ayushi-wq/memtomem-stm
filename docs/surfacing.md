@@ -21,7 +21,7 @@ flowchart LR
 
 ## How Context Extraction Works
 
-STM extracts a search query in priority order — the first match wins:
+STM extracts a search query in priority order:
 
 ```mermaid
 flowchart TD
@@ -29,20 +29,21 @@ flowchart TD
     P1 -->|yes| Use1["render template<br/>e.g. 'file {arg.path}'"]
     P1 -->|no| P2{"_context_query<br/>arg present?"}
     P2 -->|yes| Use2["use agent-provided<br/>query"]
-    P2 -->|no| P3{"path-like arg?"}
-    P3 -->|yes| Use3["tokenize on /._-<br/>'src auth jwt handler'"]
-    P3 -->|no| P4{"semantic key?<br/>(query/path/file/url/…)"}
-    P4 -->|yes| Use4["extract string value<br/>(skip UUID / hex / bool)"]
-    P4 -->|no| Use5["fallback: tool name<br/>'search_repos' → 'search repos'"]
+    P2 -->|no| P3["scan all args"]
+    P3 --> Collect["collect path-like tokens<br/>+ semantic string values<br/>(skip UUID / hex / bool)"]
+    Collect --> Has{"any tokens<br/>collected?"}
+    Has -->|yes| Use3["merged query<br/>e.g. 'src auth handler my-project'"]
+    Has -->|no| Use5["fallback: tool name<br/>'search_repos' → 'search repos'"]
 
     Use1 --> Check{"≥ min_query_tokens<br/>(default 3)?"}
     Use2 --> Check
     Use3 --> Check
-    Use4 --> Check
     Use5 --> Check
     Check -->|yes| Q["query"]
     Check -->|no| Skip["skip surfacing"]
 ```
+
+> **Note**: Steps 1 (template) and 2 (`_context_query`) are "first match wins". The heuristic fallback (step 3) iterates over **all** tool arguments and collects path-like tokenizations and semantic string values together into a merged query, rather than stopping at the first match.
 
 ## What the Agent Sees
 
