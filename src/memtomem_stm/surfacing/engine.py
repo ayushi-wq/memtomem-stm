@@ -330,6 +330,15 @@ class SurfacingEngine:
                 )
             )
             self._background_tasks.add(task)
-            task.add_done_callback(self._background_tasks.discard)
+            task.add_done_callback(self._on_webhook_done)
 
         return result
+
+    def _on_webhook_done(self, task: asyncio.Task) -> None:
+        """Log exceptions from fire-and-forget webhook tasks."""
+        self._background_tasks.discard(task)
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            logger.warning("Webhook fire-and-forget task failed: %s", exc)
