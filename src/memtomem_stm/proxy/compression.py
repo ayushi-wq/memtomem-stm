@@ -1104,7 +1104,8 @@ class LLMCompressor:
             return TruncateCompressor().compress(text, max_chars=max_chars)
 
     async def _call_api(self, text: str, *, max_chars: int) -> str:
-        assert self._client is not None
+        if self._client is None:
+            raise RuntimeError("LLMCompressor HTTP client is not initialized (missing httpx?)")
         system_prompt = self._cfg.system_prompt.format(max_chars=max_chars)
         match self._cfg.provider:
             case LLMProvider.OPENAI:
@@ -1120,7 +1121,8 @@ class LLMCompressor:
             self._client = None
 
     async def _openai(self, text: str, system_prompt: str) -> str:
-        assert self._client is not None
+        if self._client is None:
+            raise RuntimeError("LLMCompressor HTTP client is not initialized (missing httpx?)")
         url = (
             self._cfg.base_url.rstrip("/") + "/v1/chat/completions"
             if self._cfg.base_url
@@ -1142,7 +1144,8 @@ class LLMCompressor:
         return resp.json()["choices"][0]["message"]["content"]
 
     async def _anthropic(self, text: str, system_prompt: str) -> str:
-        assert self._client is not None
+        if self._client is None:
+            raise RuntimeError("LLMCompressor HTTP client is not initialized (missing httpx?)")
         url = (
             self._cfg.base_url.rstrip("/") + "/v1/messages"
             if self._cfg.base_url
@@ -1165,7 +1168,8 @@ class LLMCompressor:
         return resp.json()["content"][0]["text"]
 
     async def _ollama(self, text: str, system_prompt: str) -> str:
-        assert self._client is not None
+        if self._client is None:
+            raise RuntimeError("LLMCompressor HTTP client is not initialized (missing httpx?)")
         base = self._cfg.base_url or "http://localhost:11434"
         url = base.rstrip("/") + "/api/chat"
         resp = await self._client.post(
