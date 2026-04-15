@@ -392,6 +392,19 @@ class TestEdgeResponses:
         result = await mgr.call_tool("srv", "tool", {})
         assert result == "[empty response]"
 
+    async def test_none_content_degrades_to_empty(self):
+        """Spec-noncompliant upstream returning ``content=None`` must not crash.
+
+        The MCP spec requires ``content`` to be a list, but resilient proxies
+        should degrade rather than raise ``TypeError`` from ``for c in None``.
+        """
+        mgr = _make_manager()
+        session = _get_session(mgr)
+        session.call_tool.return_value = SimpleNamespace(content=None, isError=False)
+
+        result = await mgr.call_tool("srv", "tool", {})
+        assert result == "[empty response]"
+
     async def test_non_text_content_passthrough(self):
         mgr = _make_manager()
         session = _get_session(mgr)
