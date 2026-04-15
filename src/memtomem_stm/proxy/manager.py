@@ -893,17 +893,46 @@ class ProxyManager:
                     logger.error("Reconnect to '%s' failed: %s", server, reconnect_exc)
                     raise
 
-        # Separate text and non-text content. ``result.content`` is required by
-        # the MCP spec to be a list, but spec-noncompliant upstreams have been
-        # observed returning ``None`` — guard so we degrade to "[empty response]"
-        # via the existing empty-text-parts path instead of raising TypeError.
+        # Separate text and non-text content. ``max_upstream_chars`` is a hard
+        # OOM guard against (mis-)behaving upstreams returning huge payloads —
+        # without it, a 100 MB ``ls -R /`` response would be loaded fully into
+        # memory and walk through the entire compression pipeline before any
+        # ``max_chars`` truncation could apply. ``result.content or []`` also
+        # tolerates spec-noncompliant upstreams that return ``None`` instead
+        # of an empty list — those degrade to ``"[empty response]"``.
+        max_upstream = cfg_snap.max_upstream_chars
         text_parts: list[str] = []
         non_text_content: list = []
+        total_chars = 0
+        oversize = False
         for content in result.content or []:
             if content.type == "text":
-                text_parts.append(content.text)
+                remaining = max_upstream - total_chars
+                if remaining <= 0:
+                    oversize = True
+                    break
+                text = content.text
+                if len(text) > remaining:
+                    text_parts.append(text[:remaining])
+                    total_chars += remaining
+                    oversize = True
+                    break
+                text_parts.append(text)
+                total_chars += len(text)
             else:
                 non_text_content.append(content)
+        if oversize:
+            notice = (
+                f"\n\n[response truncated to {max_upstream} chars at "
+                f"max_upstream_chars guard — upstream returned an oversized payload]"
+            )
+            text_parts.append(notice)
+            logger.warning(
+                "Upstream %s/%s exceeded max_upstream_chars=%d — truncating",
+                server,
+                tool,
+                max_upstream,
+            )
 
         # Non-text only → pass through without compression but record metrics
         if not text_parts:
