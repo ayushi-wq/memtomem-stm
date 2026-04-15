@@ -48,6 +48,13 @@ class ResultParser:
         raise NotImplementedError
 
 
+_BLOCK_SPLIT_RE = re.compile(r"^(?=\[\d+\]\s+\d+\.?\d*\s*\|)", flags=re.MULTILINE)
+_HEADER_RE = re.compile(r"\[(\d+)\]\s+(\d+\.?\d*)\s*\|(.+)")
+_NS_RE = re.compile(r"\[([^\]]+)\]\s*(.*)")
+_RANK_SUFFIX_RE = re.compile(r"\s*\[\d+/\d+\]\s*$")
+_FIRST_TOKEN_RE = re.compile(r"(\S+)")
+
+
 class CompactResultParser(ResultParser):
     """Parse core's compact format: ``[rank] score | source > hierarchy``."""
 
@@ -56,7 +63,7 @@ class CompactResultParser(ResultParser):
         if not text or not text.strip():
             return results
 
-        blocks = re.split(r"^(?=\[\d+\]\s+\d+\.?\d*\s*\|)", text, flags=re.MULTILINE)
+        blocks = _BLOCK_SPLIT_RE.split(text)
 
         for block in blocks:
             block = block.strip()
@@ -65,23 +72,23 @@ class CompactResultParser(ResultParser):
 
             first_line, _, rest = block.partition("\n")
 
-            header_match = re.match(r"\[(\d+)\]\s+(\d+\.?\d*)\s*\|(.+)", first_line)
+            header_match = _HEADER_RE.match(first_line)
             if not header_match:
                 continue
 
             score = float(header_match.group(2))
             remainder = header_match.group(3).strip()
 
-            ns_match = re.match(r"\[([^\]]+)\]\s*(.*)", remainder)
+            ns_match = _NS_RE.match(remainder)
             if ns_match:
                 namespace = ns_match.group(1)
                 remainder = ns_match.group(2)
             else:
                 namespace = "default"
 
-            remainder = re.sub(r"\s*\[\d+/\d+\]\s*$", "", remainder)
+            remainder = _RANK_SUFFIX_RE.sub("", remainder)
 
-            source_match = re.match(r"(\S+)", remainder)
+            source_match = _FIRST_TOKEN_RE.match(remainder)
             source = source_match.group(1) if source_match else "unknown"
 
             content = rest.strip() if rest else ""
@@ -172,17 +179,30 @@ class McpClientSearchAdapter:
 
     async def start(self) -> None:
         """Connect to the memtomem MCP server."""
-        self._stack = AsyncExitStack()
-        params = StdioServerParameters(
-            command=self._config.ltm_mcp_command,
-            args=self._config.ltm_mcp_args,
-        )
-        transport = stdio_client(params)
-        streams = await self._stack.enter_async_context(transport)
-        self._session = await self._stack.enter_async_context(ClientSession(streams[0], streams[1]))
-        await self._session.initialize()
-        logger.info("MCP client connected to memtomem server: %s", self._config.ltm_mcp_command)
-        await self._negotiate_format()
+        stack = AsyncExitStack()
+        self._stack = stack
+        try:
+            params = StdioServerParameters(
+                command=self._config.ltm_mcp_command,
+                args=self._config.ltm_mcp_args,
+            )
+            transport = stdio_client(params)
+            streams = await stack.enter_async_context(transport)
+            self._session = await stack.enter_async_context(ClientSession(streams[0], streams[1]))
+            await self._session.initialize()
+            logger.info("MCP client connected to memtomem server: %s", self._config.ltm_mcp_command)
+            await self._negotiate_format()
+        except BaseException:
+            # Roll back any contexts we entered (transport subprocess, session
+            # streams) so a failed start — common during reconnect storms —
+            # doesn't leak file descriptors and child processes across retries.
+            try:
+                await stack.aclose()
+            except Exception:
+                logger.debug("Error during MCP client start() cleanup", exc_info=True)
+            self._stack = None
+            self._session = None
+            raise
 
     async def _negotiate_format(self) -> None:
         """Downgrade to compact if core doesn't advertise structured support.
@@ -274,7 +294,9 @@ class McpClientSearchAdapter:
             return [], None
 
         # Parse text response into results
-        text_parts = [c.text for c in result.content if c.type == "text"]
+        # ``result.content or []`` tolerates spec-noncompliant upstreams that
+        # return ``None`` instead of an empty list (mirrors PR #114 in proxy).
+        text_parts = [c.text for c in (result.content or []) if c.type == "text"]
         if not text_parts:
             return [], None
 
@@ -347,7 +369,9 @@ class McpClientSearchAdapter:
             logger.debug("MCP mem_do(scratch_get) failed: %s", exc)
             return []
 
-        text_parts = [c.text for c in result.content if c.type == "text"]
+        # ``result.content or []`` tolerates spec-noncompliant upstreams that
+        # return ``None`` instead of an empty list (mirrors PR #114 in proxy).
+        text_parts = [c.text for c in (result.content or []) if c.type == "text"]
         if not text_parts:
             return []
 

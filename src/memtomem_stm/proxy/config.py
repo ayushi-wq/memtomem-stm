@@ -4,13 +4,59 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from enum import StrEnum
 from pathlib import Path
-from typing import Any, Self
 
 from pydantic import BaseModel, Field, model_validator
 
 logger = logging.getLogger(__name__)
+
+
+_PROXY_ENV_PREFIX = "MEMTOMEM_STM_PROXY__"
+
+
+def collect_proxy_env_overrides(environ: dict[str, str] | None = None) -> dict[str, Any]:
+    """Build a nested dict from ``MEMTOMEM_STM_PROXY__*`` env vars.
+
+    Used to layer env-set proxy fields on top of the JSON config file so the
+    documented precedence (env > file > defaults) holds end-to-end. Without
+    this, the file-load path in ``server.py`` would clobber every env-set
+    field except ``MEMTOMEM_STM_PROXY__ENABLED``.
+
+    The returned dict mirrors the JSON config shape — nested by ``__``
+    delimiters, lower-cased — and pydantic's coercion handles type
+    conversion at validation time.
+    """
+    env = environ if environ is not None else dict(os.environ)
+    overrides: dict[str, Any] = {}
+    for key, val in env.items():
+        if not key.startswith(_PROXY_ENV_PREFIX):
+            continue
+        path = [p.lower() for p in key[len(_PROXY_ENV_PREFIX) :].split("__") if p]
+        if not path:
+            continue
+        cursor = overrides
+        for part in path[:-1]:
+            existing = cursor.get(part)
+            if not isinstance(existing, dict):
+                existing = {}
+                cursor[part] = existing
+            cursor = existing
+        cursor[path[-1]] = val
+    return overrides
+
+
+def _deep_merge(base: dict[str, Any], overrides: dict[str, Any]) -> dict[str, Any]:
+    """Recursively merge *overrides* on top of *base*; returns a new dict."""
+    out = dict(base)
+    for k, v in overrides.items():
+        existing = out.get(k)
+        if isinstance(v, dict) and isinstance(existing, dict):
+            out[k] = _deep_merge(existing, v)
+        else:
+            out[k] = v
+    return out
 
 
 class CompressionStrategy(StrEnum):
@@ -52,7 +98,23 @@ class LLMCompressorConfig(BaseModel):
         "Summarize the following content concisely, preserving all key information. "
         "Keep the summary under {max_chars} characters."
     )
-    max_tokens: int = 500
+    max_tokens: int = Field(default=500, gt=0)
+
+    @model_validator(mode="after")
+    def _require_api_key_for_hosted_providers(self) -> LLMCompressorConfig:
+        if self.provider not in (LLMProvider.OPENAI, LLMProvider.ANTHROPIC):
+            return self
+        if self.api_key:
+            return self
+        env_var = "OPENAI_API_KEY" if self.provider == LLMProvider.OPENAI else "ANTHROPIC_API_KEY"
+        env_val = os.environ.get(env_var, "").strip()
+        if env_val:
+            self.api_key = env_val
+            return self
+        raise ValueError(
+            f"api_key is required for provider='{self.provider.value}' "
+            f"(set api_key in config or the {env_var} environment variable)"
+        )
 
 
 class CleaningConfig(BaseModel):
@@ -73,15 +135,15 @@ class HybridConfig(BaseModel):
 class SelectiveConfig(BaseModel):
     max_pending: int = Field(default=100, gt=0)
     pending_ttl_seconds: float = Field(default=300.0, ge=0.0)
-    json_depth: int = 1
-    min_section_chars: int = 50
-    pending_store: str = "memory"  # "memory" | "sqlite"
+    json_depth: int = Field(default=1, gt=0)
+    min_section_chars: int = Field(default=50, ge=0)
+    pending_store: Literal["memory", "sqlite"] = "memory"
     pending_store_path: Path = Path("~/.memtomem/pending_selections.db")
 
 
 class AutoIndexConfig(BaseModel):
     enabled: bool = False
-    min_chars: int = 2000
+    min_chars: int = Field(default=2000, ge=0)
     memory_dir: Path = Path("~/.memtomem/proxy_index")
     namespace: str = "proxy-{server}"
 
@@ -127,13 +189,13 @@ class ExtractionConfig(BaseModel):
     enabled: bool = False
     strategy: ExtractionStrategy = ExtractionStrategy.LLM
     llm: LLMCompressorConfig | None = None
-    max_facts: int = 10
-    min_response_chars: int = 500
-    dedup_threshold: float = 0.92
+    max_facts: int = Field(default=10, gt=0)
+    min_response_chars: int = Field(default=500, ge=0)
+    dedup_threshold: float = Field(default=0.92, ge=0.0, le=1.0)
     memory_dir: Path = Path("~/.memtomem/extracted_facts")
     namespace: str = "facts-{server}"
     background: bool = True
-    max_input_chars: int = 20000
+    max_input_chars: int = Field(default=20000, gt=0)
 
     def effective_llm(self) -> LLMCompressorConfig:
         """Return user-provided LLM config or the default (Ollama qwen3:4b)."""
@@ -304,7 +366,7 @@ class RelevanceScorerConfig(BaseModel):
     """Embedding API base URL. Defaults to the provider's standard endpoint
     (Ollama → http://localhost:11434, OpenAI → https://api.openai.com).
     Only used when scorer="embedding"."""
-    embedding_timeout: float = 10.0
+    embedding_timeout: float = Field(default=10.0, gt=0.0)
     """Embedding API timeout in seconds."""
 
     @model_validator(mode="after")
@@ -322,6 +384,16 @@ class ProxyConfig(BaseModel):
     upstream_servers: dict[str, UpstreamServerConfig] = {}
     default_compression: CompressionStrategy = CompressionStrategy.AUTO
     default_max_result_chars: int = Field(default=16000, gt=0)
+    max_upstream_chars: int = Field(default=10_000_000, gt=0)
+    """Hard cap on the size of the upstream response loaded into memory before
+    compression. A misbehaving (or malicious) upstream returning a 100 MB
+    payload would otherwise OOM the proxy. When the cap is exceeded the
+    response is truncated with a notice and the call is recorded as
+    ``upstream_error`` / ``oversize`` in ``proxy_metrics.db``.
+
+    Default 10 M chars (~10 MB UTF-8). Per-server / per-tool overrides are a
+    follow-up if needed.
+    """
     min_result_retention: float = Field(default=0.65, ge=0.0, le=1.0)
     relevance_scorer: RelevanceScorerConfig = Field(default_factory=RelevanceScorerConfig)
     """Minimum fraction of response to preserve after compression (0-1).
@@ -366,12 +438,27 @@ class ProxyConfig(BaseModel):
         return min(model_budget, self.default_max_result_chars)
 
     @staticmethod
-    def load_from_file(path: Path) -> ProxyConfig | None:
-        """Load config from *path*.  Returns ``None`` on parse/validation error
-        (distinct from file-not-found which returns a default ``ProxyConfig``)."""
+    def load_from_file(
+        path: Path, env_overrides: dict[str, Any] | None = None
+    ) -> ProxyConfig | None:
+        """Load config from *path*. Returns ``None`` on parse/validation error
+        (distinct from file-not-found which returns a default ``ProxyConfig``).
+
+        When *env_overrides* is supplied it is deep-merged on top of the file
+        contents so env-set fields win over file-set fields, matching the
+        ``env > file > defaults`` precedence documented in
+        ``docs/configuration.md``.
+        """
         resolved = path.expanduser().resolve()
         if not resolved.exists():
             logger.debug("Proxy config file not found: %s", resolved)
+            if env_overrides:
+                try:
+                    return ProxyConfig.model_validate(env_overrides)
+                except Exception as exc:
+                    logger.warning(
+                        "Env-only proxy config failed validation: %s — using defaults", exc
+                    )
             return ProxyConfig()
         # Warn if config is group/world-readable (may contain API keys)
         try:
@@ -386,6 +473,8 @@ class ProxyConfig(BaseModel):
             pass
         try:
             data: dict[str, Any] = json.loads(resolved.read_text(encoding="utf-8"))
+            if env_overrides:
+                data = _deep_merge(data, env_overrides)
             return ProxyConfig.model_validate(data)
         except (json.JSONDecodeError, Exception) as exc:
             logger.warning("Failed to parse proxy config %s: %s", resolved, exc)
@@ -393,12 +482,18 @@ class ProxyConfig(BaseModel):
 
 
 class ProxyConfigLoader:
-    """mtime-based hot-reload for proxy config file."""
+    """mtime-based hot-reload for proxy config file.
 
-    def __init__(self, path: Path) -> None:
+    Env overrides captured at construction time are re-applied on every
+    reload so ``MEMTOMEM_STM_PROXY__*`` settings continue to win over file
+    contents after the agent edits ``stm_proxy.json`` at runtime.
+    """
+
+    def __init__(self, path: Path, env_overrides: dict[str, Any] | None = None) -> None:
         self._path = path.expanduser().resolve()
         self._cached: ProxyConfig | None = None
         self._mtime: float = 0.0
+        self._env_overrides = env_overrides or {}
 
     def seed(self, config: ProxyConfig) -> None:
         self._cached = config
@@ -413,12 +508,19 @@ class ProxyConfigLoader:
         except OSError:
             if self._cached is not None:
                 return self._cached
-            return ProxyConfig.load_from_file(self._path) or ProxyConfig()
+            return (
+                ProxyConfig.load_from_file(self._path, env_overrides=self._env_overrides)
+                or ProxyConfig()
+            )
         if mtime != self._mtime or self._cached is None:
-            loaded = ProxyConfig.load_from_file(self._path)
+            loaded = ProxyConfig.load_from_file(self._path, env_overrides=self._env_overrides)
             if loaded is not None:
                 self._cached = loaded
+                self._mtime = mtime
             else:
+                # Don't advance _mtime on parse failure: the next get() must
+                # retry instead of treating the broken file as up-to-date,
+                # otherwise a fix that lands within filesystem mtime
+                # granularity (or before any other write) would be ignored.
                 logger.warning("Proxy config parse failed; keeping previous config")
-            self._mtime = mtime
         return self._cached  # type: ignore[return-value]

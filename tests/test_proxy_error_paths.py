@@ -392,6 +392,40 @@ class TestEdgeResponses:
         result = await mgr.call_tool("srv", "tool", {})
         assert result == "[empty response]"
 
+    async def test_none_content_degrades_to_empty(self):
+        """Spec-noncompliant upstream returning ``content=None`` must not crash.
+
+        The MCP spec requires ``content`` to be a list, but resilient proxies
+        should degrade rather than raise ``TypeError`` from ``for c in None``.
+        """
+        mgr = _make_manager()
+        session = _get_session(mgr)
+        session.call_tool.return_value = SimpleNamespace(content=None, isError=False)
+
+        result = await mgr.call_tool("srv", "tool", {})
+        assert result == "[empty response]"
+
+    async def test_text_field_none_degrades(self):
+        """Spec-noncompliant upstream returning ``TextContent.text=None`` must not crash.
+
+        Mirrors ``test_none_content_degrades_to_empty`` one level down: the MCP
+        spec requires ``TextContent.text`` to be ``str``, but the same upstream
+        servers that produce ``content=None`` also occasionally produce a
+        TextContent whose ``text`` field is ``None``. Without the ``or ""``
+        guard, ``len(text)`` raises ``TypeError`` and the failure propagates
+        before the metrics row is recorded — the same failure mode #114 fixed
+        for ``content`` itself.
+        """
+        mgr = _make_manager()
+        session = _get_session(mgr)
+        none_text = SimpleNamespace(type="text", text=None)
+        session.call_tool.return_value = SimpleNamespace(content=[none_text], isError=False)
+
+        # Should not raise; concrete return value is implementation-defined
+        # (the empty text passes through compression as an empty payload).
+        result = await mgr.call_tool("srv", "tool", {})
+        assert isinstance(result, str)
+
     async def test_non_text_content_passthrough(self):
         mgr = _make_manager()
         session = _get_session(mgr)
@@ -407,15 +441,67 @@ class TestEdgeResponses:
         session = _get_session(mgr)
         text = _text_content("hello world")
         img = SimpleNamespace(type="image", data="png")
-        session.call_tool.return_value = SimpleNamespace(
-            content=[text, img], isError=False
-        )
+        session.call_tool.return_value = SimpleNamespace(content=[text, img], isError=False)
 
         result = await mgr.call_tool("srv", "tool", {})
         assert isinstance(result, list)
         assert len(result) == 2
         assert result[0].type == "text"
         assert result[1].type == "image"
+
+
+# ── max_upstream_chars hard cap ──────────────────────────────────────────
+
+
+class TestMaxUpstreamChars:
+    """Guards against OOM from upstreams returning huge payloads (#108)."""
+
+    async def test_oversized_response_truncated_with_notice(self):
+        mgr = _make_manager(compression=CompressionStrategy.NONE)
+        # Shrink the cap for fast testing; default is 10 M chars.
+        mgr._config_loader._cached.max_upstream_chars = 100  # type: ignore[union-attr]
+
+        session = _get_session(mgr)
+        big = "a" * 500
+        session.call_tool.return_value = _make_result(big)
+
+        result = await mgr.call_tool("srv", "tool", {})
+
+        assert isinstance(result, str)
+        assert "max_upstream_chars guard" in result
+        # Truncation was hard — text body cut to the cap (100), then the notice.
+        body = result.split("\n\n[response truncated")[0]
+        assert body == "a" * 100
+
+    async def test_under_cap_passes_through_unchanged(self):
+        mgr = _make_manager(compression=CompressionStrategy.NONE)
+        mgr._config_loader._cached.max_upstream_chars = 1000  # type: ignore[union-attr]
+
+        session = _get_session(mgr)
+        session.call_tool.return_value = _make_result("hello world")
+
+        result = await mgr.call_tool("srv", "tool", {})
+        assert result == "hello world"
+        assert "max_upstream_chars guard" not in result
+
+    async def test_cap_applies_across_multiple_text_blocks(self):
+        """The cap aggregates across blocks; not per-block."""
+        mgr = _make_manager(compression=CompressionStrategy.NONE)
+        mgr._config_loader._cached.max_upstream_chars = 50  # type: ignore[union-attr]
+
+        session = _get_session(mgr)
+        # Two 30-char blocks → 60 chars total > 50 cap
+        block_a = _text_content("a" * 30)
+        block_b = _text_content("b" * 30)
+        session.call_tool.return_value = SimpleNamespace(content=[block_a, block_b], isError=False)
+
+        result = await mgr.call_tool("srv", "tool", {})
+
+        assert "max_upstream_chars guard" in result
+        body = result.split("\n\n[response truncated")[0]
+        # First block fully kept (30 chars), second cut to remaining 20 chars.
+        # Joined with "\n" between text_parts.
+        assert body == "a" * 30 + "\n" + "b" * 20
 
 
 # ── Surfacing failure: graceful degradation ──────────────────────────────
@@ -435,6 +521,75 @@ class TestSurfacingFailure:
         result = await mgr.call_tool("srv", "tool", {})
         # Should get the text back, not an exception
         assert "hello world" in result
+
+
+# ── Pipeline-stage exceptions: must surface in proxy_metrics as INTERNAL_ERROR ─
+
+
+class TestPipelineExceptionMetrics:
+    async def test_compress_failure_records_internal_error(self):
+        """If a COMPRESS-stage exception escapes _call_tool_inner, the outer
+        wrapper must record an INTERNAL_ERROR metrics row before re-raising
+        — otherwise operators are blind to in-pipeline failures."""
+        from memtomem_stm.proxy.metrics import ErrorCategory
+
+        mgr = _make_manager()
+        session = _get_session(mgr)
+        session.call_tool.return_value = _make_result("hello world")
+
+        # Force the compression stage to raise after upstream succeeds
+        with patch.object(
+            mgr, "_apply_compression", new_callable=AsyncMock, side_effect=RuntimeError("boom")
+        ):
+            with pytest.raises(RuntimeError, match="boom"):
+                await mgr.call_tool("srv", "tool", {})
+
+        # An INTERNAL_ERROR row must be present
+        assert mgr.tracker._errors_by_category[ErrorCategory.INTERNAL_ERROR.value] == 1
+        # And no double-count from typed paths
+        for cat in (
+            ErrorCategory.TRANSPORT,
+            ErrorCategory.TIMEOUT,
+            ErrorCategory.PROTOCOL,
+            ErrorCategory.UPSTREAM_ERROR,
+            ErrorCategory.PROGRAMMING,
+        ):
+            assert mgr.tracker._errors_by_category[cat.value] == 0
+
+    async def test_typed_upstream_error_not_double_recorded(self):
+        """A transport error already records its own row; the outer wrapper
+        must not add a second INTERNAL_ERROR row."""
+        from memtomem_stm.proxy.metrics import ErrorCategory
+
+        mgr = _make_manager(max_retries=0)
+        session = _get_session(mgr)
+        session.call_tool.side_effect = ConnectionError("down")
+
+        with patch.object(mgr, "_reconnect_server", new_callable=AsyncMock):
+            with pytest.raises(ConnectionError):
+                await mgr.call_tool("srv", "tool", {})
+
+        # Exactly one row, classified TRANSPORT — not INTERNAL_ERROR
+        assert mgr.tracker._errors_by_category[ErrorCategory.TRANSPORT.value] == 1
+        assert mgr.tracker._errors_by_category[ErrorCategory.INTERNAL_ERROR.value] == 0
+
+    async def test_upstream_iserror_not_double_recorded(self):
+        """A result.isError=True path raises ToolError after recording an
+        UPSTREAM_ERROR row; the outer wrapper must not add INTERNAL_ERROR."""
+        from mcp.server.fastmcp.exceptions import ToolError
+
+        from memtomem_stm.proxy.metrics import ErrorCategory
+
+        mgr = _make_manager()
+        session = _get_session(mgr)
+        session.call_tool.return_value = _make_result("oops", is_error=True)
+
+        with patch.object(mgr, "_reconnect_server", new_callable=AsyncMock):
+            with pytest.raises(ToolError):
+                await mgr.call_tool("srv", "tool", {})
+
+        assert mgr.tracker._errors_by_category[ErrorCategory.UPSTREAM_ERROR.value] == 1
+        assert mgr.tracker._errors_by_category[ErrorCategory.INTERNAL_ERROR.value] == 0
 
 
 # ── Context query stripping ──────────────────────────────────────────────
@@ -493,3 +648,22 @@ class TestCacheWithErrors:
         assert result == "cached result"
         session.call_tool.assert_not_called()
         assert mgr.tracker.get_summary()["cache_hits"] == 1
+
+    async def test_cache_set_failure_does_not_break_response(self):
+        """A failing ``cache.set`` (SQLite lock timeout, disk full, etc.)
+        must not discard a successful upstream response. Cache writes are
+        an optional fast-path, not a correctness dependency: a swallowed
+        warning is the expected behaviour."""
+        mgr = _make_manager()
+        session = _get_session(mgr)
+        session.call_tool.return_value = _make_result("hello world")
+
+        cache = MagicMock()
+        cache.get.return_value = None  # miss → upstream is consulted
+        cache.set.side_effect = RuntimeError("simulated SQLite lock timeout")
+        mgr._cache = cache
+
+        # Must not raise — response returns normally.
+        result = await mgr.call_tool("srv", "tool", {})
+        assert "hello world" in result
+        cache.set.assert_called_once()

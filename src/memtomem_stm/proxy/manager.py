@@ -99,6 +99,19 @@ class UpstreamConnection:
     stack: AsyncExitStack | None = None
 
 
+def _mark_recorded(exc: BaseException) -> None:
+    """Tag *exc* so the outer ``call_tool`` wrapper does not double-record it.
+
+    The pipeline records its own typed metrics rows for upstream / transport /
+    timeout / protocol errors. The ``call_tool`` outer wrapper catches anything
+    else as ``INTERNAL_ERROR``; this marker keeps the two paths from racing.
+    """
+    try:
+        exc._stm_metrics_recorded = True  # type: ignore[attr-defined]
+    except (AttributeError, TypeError):
+        pass
+
+
 class ProxyManager:
     def __init__(
         self,
@@ -107,8 +120,9 @@ class ProxyManager:
         index_engine: FileIndexer | None = None,
         surfacing_engine: SurfacingEngine | None = None,
         cache: ProxyCache | None = None,
+        env_overrides: dict[str, Any] | None = None,
     ) -> None:
-        self._config_loader = ProxyConfigLoader(config.config_path)
+        self._config_loader = ProxyConfigLoader(config.config_path, env_overrides=env_overrides)
         self._config_loader.seed(config)
         self.tracker = tracker
         self._index_engine = index_engine
@@ -701,7 +715,30 @@ class ProxyManager:
             "proxy_call",
             metadata={"server": server, "tool": tool, "trace_id": trace_id},
         ):
-            return await self._call_tool_inner(server, tool, arguments, trace_id=trace_id)
+            try:
+                return await self._call_tool_inner(server, tool, arguments, trace_id=trace_id)
+            except Exception as exc:
+                # Upstream/transport/timeout/protocol errors are already
+                # recorded inside _call_tool_inner via record_error(); a raise
+                # that escapes to here means a CLEAN/COMPRESS/SURFACE/INDEX
+                # stage threw after the upstream call had already returned.
+                # Without this guard the metrics row was silently skipped,
+                # leaving operators blind to in-pipeline failures.
+                if not getattr(exc, "_stm_metrics_recorded", False):
+                    try:
+                        self.tracker.record_error(
+                            CallMetrics(
+                                server=server,
+                                tool=tool,
+                                original_chars=0,
+                                compressed_chars=0,
+                                trace_id=trace_id,
+                                error_category=ErrorCategory.INTERNAL_ERROR,
+                            )
+                        )
+                    except Exception:
+                        logger.debug("Failed to record INTERNAL_ERROR metrics row", exc_info=True)
+                raise
 
     async def _call_tool_inner(
         self,
@@ -779,6 +816,7 @@ class ProxyManager:
                             trace_id=trace_id,
                         )
                     )
+                    _mark_recorded(exc)
                     raise
 
                 # Protocol errors (bad params, unknown method) — don't retry,
@@ -799,6 +837,7 @@ class ProxyManager:
                             trace_id=trace_id,
                         )
                     )
+                    _mark_recorded(exc)
                     try:
                         await self._reconnect_server(server)
                     except Exception:
@@ -826,6 +865,7 @@ class ProxyManager:
                             trace_id=trace_id,
                         )
                     )
+                    _mark_recorded(exc)
                     # Reconnect before raising so the NEXT call starts fresh
                     try:
                         await self._reconnect_server(server)
@@ -853,14 +893,50 @@ class ProxyManager:
                     logger.error("Reconnect to '%s' failed: %s", server, reconnect_exc)
                     raise
 
-        # Separate text and non-text content
+        # Separate text and non-text content. ``max_upstream_chars`` is a hard
+        # OOM guard against (mis-)behaving upstreams returning huge payloads —
+        # without it, a 100 MB ``ls -R /`` response would be loaded fully into
+        # memory and walk through the entire compression pipeline before any
+        # ``max_chars`` truncation could apply. ``result.content or []`` also
+        # tolerates spec-noncompliant upstreams that return ``None`` instead
+        # of an empty list — those degrade to ``"[empty response]"``.
+        max_upstream = cfg_snap.max_upstream_chars
         text_parts: list[str] = []
         non_text_content: list = []
-        for content in result.content:
+        total_chars = 0
+        oversize = False
+        for content in result.content or []:
             if content.type == "text":
-                text_parts.append(content.text)
+                remaining = max_upstream - total_chars
+                if remaining <= 0:
+                    oversize = True
+                    break
+                # ``content.text or ""`` tolerates spec-noncompliant upstreams
+                # that return ``None`` for a TextContent's ``text`` field.
+                # MCP spec requires ``text: str`` but mirrors the same gap
+                # that PR #114 fixed for ``result.content`` itself.
+                text = content.text or ""
+                if len(text) > remaining:
+                    text_parts.append(text[:remaining])
+                    total_chars += remaining
+                    oversize = True
+                    break
+                text_parts.append(text)
+                total_chars += len(text)
             else:
                 non_text_content.append(content)
+        if oversize:
+            notice = (
+                f"\n\n[response truncated to {max_upstream} chars at "
+                f"max_upstream_chars guard — upstream returned an oversized payload]"
+            )
+            text_parts.append(notice)
+            logger.warning(
+                "Upstream %s/%s exceeded max_upstream_chars=%d — truncating",
+                server,
+                tool,
+                max_upstream,
+            )
 
         # Non-text only → pass through without compression but record metrics
         if not text_parts:
@@ -895,7 +971,9 @@ class ProxyManager:
             # proxied response instead of silently converting to a normal result.
             from mcp.server.fastmcp.exceptions import ToolError
 
-            raise ToolError(original_text)
+            tool_err = ToolError(original_text)
+            _mark_recorded(tool_err)
+            raise tool_err
 
         # Resolve effective settings (using config snapshot)
         tc = self._resolve_tool_config(server, tool, proxy_cfg=cfg_snap)
@@ -1196,14 +1274,25 @@ class ProxyManager:
         )
 
         # ── Cache store (pre-surfacing content so memories stay fresh on hit) ──
+        # Cache writes are an optional fast-path: a SQLite lock timeout, disk
+        # full, or any other store error must NOT propagate to the agent and
+        # discard a successful upstream response. Log and continue.
         if self._cache is not None and not non_text_content:
-            self._cache.set(
-                server,
-                tool,
-                upstream_args,
-                compressed,
-                ttl_seconds=cfg_snap.cache.default_ttl_seconds,
-            )
+            try:
+                self._cache.set(
+                    server,
+                    tool,
+                    upstream_args,
+                    compressed,
+                    ttl_seconds=cfg_snap.cache.default_ttl_seconds,
+                )
+            except Exception:
+                logger.warning(
+                    "Cache store failed for %s/%s — response unaffected",
+                    server,
+                    tool,
+                    exc_info=True,
+                )
 
         # Combine compressed text with preserved non-text content
         if non_text_content:
