@@ -137,6 +137,18 @@ class TestReadMore:
         result = await stm_proxy_read_more(key="k1", offset=-1, ctx=ctx)
         assert "offset must be >= 0" in result.lower()
 
+    async def test_negative_limit(self):
+        """Negative limit returns an error message."""
+        ctx = _make_ctx()
+        result = await stm_proxy_read_more(key="k1", offset=0, limit=-1, ctx=ctx)
+        assert "limit must be >= 1" in result.lower()
+
+    async def test_zero_limit(self):
+        """Zero limit returns an error message."""
+        ctx = _make_ctx()
+        result = await stm_proxy_read_more(key="k1", offset=0, limit=0, ctx=ctx)
+        assert "limit must be >= 1" in result.lower()
+
     async def test_delegates(self):
         """stm_proxy_read_more delegates to proxy_manager.read_more."""
         pm = _make_proxy_manager()
@@ -418,3 +430,56 @@ class TestLifespan:
             async with app_lifespan(mcp) as ctx:
                 assert ctx.feedback_tracker is None
                 assert captured_engine_kwargs.get("feedback_tracker") is None
+
+    async def test_init_failure_after_mcp_adapter_runs_cleanup(self):
+        """If a post-mcp_adapter init step raises (e.g. proxy_manager.start()),
+        the mcp_adapter stdio subprocess must still be stopped. Without the
+        outer try/finally, a partial init leaked the surfacing subprocess and
+        metrics/cache sqlite connections because the cleanup block only ran
+        after reaching `yield`."""
+        import pytest
+
+        from memtomem_stm.server import app_lifespan, mcp
+
+        mock_pm_instance = MagicMock()
+        mock_pm_instance.start = AsyncMock(side_effect=RuntimeError("upstream down"))
+        mock_pm_instance.stop = AsyncMock()
+        mock_pm_instance.get_proxy_tools.return_value = []
+
+        mock_adapter = MagicMock()
+        mock_adapter.start = AsyncMock()
+        mock_adapter.stop = AsyncMock()
+
+        with (
+            patch("memtomem_stm.server.STMConfig") as MockConfig,
+            patch("memtomem_stm.server.ProxyManager", return_value=mock_pm_instance),
+            patch(
+                "memtomem_stm.surfacing.mcp_client.McpClientSearchAdapter",
+                return_value=mock_adapter,
+            ),
+            patch("memtomem_stm.server.SurfacingEngine", return_value=MagicMock()),
+            # Prevent the file-load block at the top of app_lifespan from
+            # overwriting our mocked ProxyConfig with the real on-disk one
+            # (or its defaults when the file is missing).
+            patch("memtomem_stm.server.ProxyConfig.load_from_file", return_value=None),
+        ):
+            mock_cfg = MockConfig.return_value
+            mock_cfg.proxy = MagicMock()
+            mock_cfg.proxy.enabled = True
+            mock_cfg.proxy.config_path = Path("/tmp/proxy.json")
+            mock_cfg.proxy.metrics.enabled = False
+            mock_cfg.proxy.compression_feedback.enabled = False
+            mock_cfg.proxy.cache.enabled = False
+            mock_cfg.surfacing = MagicMock()
+            mock_cfg.surfacing.enabled = True
+            mock_cfg.surfacing.feedback_enabled = False
+            mock_cfg.langfuse = MagicMock()
+            mock_cfg.langfuse.enabled = False
+
+            with pytest.raises(RuntimeError, match="upstream down"):
+                async with app_lifespan(mcp) as _ctx:
+                    pass  # Never reached — start() raises before yield.
+
+        # The cleanup block must run even though yield was never reached.
+        mock_adapter.stop.assert_awaited_once()
+        mock_pm_instance.stop.assert_awaited_once()

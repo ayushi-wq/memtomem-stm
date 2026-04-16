@@ -21,6 +21,7 @@ from mcp.client.sse import sse_client
 from mcp.client.stdio import StdioServerParameters, stdio_client
 from mcp.client.streamable_http import streamablehttp_client
 
+from memtomem_stm.proxy.cache import _make_key as _cache_key
 from memtomem_stm.proxy.cleaning import DefaultContentCleaner
 from memtomem_stm.proxy.compression import (
     HybridCompressor,
@@ -131,10 +132,12 @@ class ProxyManager:
         self._connections: dict[str, UpstreamConnection] = {}
         self._stack: AsyncExitStack | None = None
         self._selective_compressor: SelectiveCompressor | None = None
+        self._selective_compressor_cfg: SelectiveConfig | None = None
         self._selective_lock = asyncio.Lock()
         self._extractor: FactExtractor | None = None
         self._extractor_lock = asyncio.Lock()
         self._progressive_store: ProgressiveStoreAdapter | None = None
+        self._progressive_store_cfg: SelectiveConfig | None = None
         self._progressive_lock = asyncio.Lock()
         self._llm_compressor: LLMCompressor | None = None
         self._llm_compressor_cfg: LLMCompressorConfig | None = None
@@ -142,6 +145,13 @@ class ProxyManager:
         self._relevance_scorer_instance = self._create_scorer(config)
         self._relevance_scorer_cfg = config.relevance_scorer
         self._background_tasks: set[asyncio.Task] = set()
+        # Per-key stampede guard — identical concurrent ``call_tool`` invocations
+        # serialize on the same lock so a cache miss triggers one upstream
+        # call rather than N. Entries are popped when the work completes so
+        # the dict stays bounded by the number of in-flight unique keys.
+        # Named ``_key_locks`` to match the same pattern used by
+        # ``SurfacingEngine`` (extractable into a shared helper later).
+        self._key_locks: dict[str, asyncio.Lock] = {}
 
     async def start(self) -> None:
         """Connect to all upstream servers, discover their tools."""
@@ -239,12 +249,22 @@ class ProxyManager:
                 logger.debug("Failed to close previous stack for '%s'", name, exc_info=True)
 
         conn_stack = AsyncExitStack()
-        transport_ctx = self._open_transport(cfg)
-        streams = await conn_stack.enter_async_context(transport_ctx)
-        read, write = streams[0], streams[1]
-        session = await conn_stack.enter_async_context(ClientSession(read, write))
-        await asyncio.wait_for(session.initialize(), timeout=cfg.connect_timeout_seconds)
-        result = await session.list_tools()
+        try:
+            transport_ctx = self._open_transport(cfg)
+            streams = await conn_stack.enter_async_context(transport_ctx)
+            read, write = streams[0], streams[1]
+            session = await conn_stack.enter_async_context(ClientSession(read, write))
+            await asyncio.wait_for(session.initialize(), timeout=cfg.connect_timeout_seconds)
+            result = await session.list_tools()
+        except BaseException:
+            # Roll back any contexts we entered (transport subprocess, session
+            # streams). Without this, a failed reconnect leaks file descriptors
+            # and child processes across retry storms.
+            try:
+                await conn_stack.aclose()
+            except Exception:
+                logger.debug("Error during reconnect cleanup for '%s'", name, exc_info=True)
+            raise
 
         conn.session = session
         conn.stack = conn_stack
@@ -252,11 +272,29 @@ class ProxyManager:
         logger.info("Reconnected to '%s' (%s tools)", name, len(conn.tools))
 
     async def stop(self) -> None:
-        # Cancel and drain background tasks (extraction, etc.)
-        for task in self._background_tasks:
-            task.cancel()
-        if self._background_tasks:
-            await asyncio.gather(*self._background_tasks, return_exceptions=True)
+        # Cancel and drain background tasks (extraction, etc.). Loop until
+        # the set is empty — a concurrent call_tool may schedule a new
+        # extraction task during our gather await (``call_tool`` adds to
+        # ``_background_tasks`` after ``asyncio.create_task(...)``), and
+        # ``asyncio.gather(*snapshot)`` only awaits the snapshot, leaving
+        # a late task pending. A second iteration catches and cancels it.
+        # Bound the loop so a pathological task that keeps scheduling
+        # replacements can't spin forever.
+        for _ in range(8):
+            if not self._background_tasks:
+                break
+            batch = list(self._background_tasks)
+            for task in batch:
+                task.cancel()
+            await asyncio.gather(*batch, return_exceptions=True)
+            for task in batch:
+                self._background_tasks.discard(task)
+        else:
+            logger.warning(
+                "ProxyManager.stop(): %d background tasks still pending after "
+                "drain loop; leaking them",
+                len(self._background_tasks),
+            )
         self._background_tasks.clear()
         # Close httpx clients
         if self._llm_compressor is not None:
@@ -493,8 +531,9 @@ class ProxyManager:
 
         if compression == CompressionStrategy.SELECTIVE:
             async with self._selective_lock:
-                if self._selective_compressor is None:
+                if self._selective_compressor is None or self._selective_compressor_cfg != sel_cfg:
                     self._selective_compressor = self._create_selective(sel_cfg)
+                    self._selective_compressor_cfg = sel_cfg
             return self._selective_compressor.compress(text, max_chars=max_chars), None
 
         if compression == CompressionStrategy.LLM_SUMMARY:
@@ -505,8 +544,12 @@ class ProxyManager:
                             await self._llm_compressor.close()
                         self._llm_compressor = LLMCompressor(llm_cfg)
                         self._llm_compressor_cfg = llm_cfg
-                result = await self._llm_compressor.compress(text, max_chars=max_chars)
-                return result, self._llm_compressor.last_fallback
+                    # Capture the current instance under the lock so a later
+                    # concurrent config swap can't re-bind ``self._llm_compressor``
+                    # before we read ``.last_fallback`` below.
+                    compressor = self._llm_compressor
+                result = await compressor.compress(text, max_chars=max_chars)
+                return result, compressor.last_fallback
             logger.warning(
                 "LLM_SUMMARY requested for %s/%s but no llm config found; falling back to truncate",
                 server,
@@ -569,8 +612,9 @@ class ProxyManager:
     ) -> str:
         cfg = hybrid_cfg or HybridConfig()
         async with self._selective_lock:
-            if self._selective_compressor is None:
+            if self._selective_compressor is None or self._selective_compressor_cfg != sel_cfg:
                 self._selective_compressor = self._create_selective(sel_cfg)
+                self._selective_compressor_cfg = sel_cfg
 
         compressor = HybridCompressor(
             head_chars=cfg.head_chars,
@@ -646,15 +690,34 @@ class ProxyManager:
             return "Selective compression not active — no pending TOC selections."
         return self._selective_compressor.select(key, sections)
 
-    def _get_progressive_store(self) -> ProgressiveStoreAdapter:
-        if self._progressive_store is None:
-            from memtomem_stm.proxy.pending_store import InMemoryPendingStore
+    def _get_progressive_store(
+        self, sel_cfg: SelectiveConfig | None = None
+    ) -> ProgressiveStoreAdapter:
+        if self._progressive_store is None or (
+            sel_cfg is not None and sel_cfg != self._progressive_store_cfg
+        ):
+            if sel_cfg is not None and sel_cfg.pending_store == "sqlite":
+                from memtomem_stm.proxy.pending_store import SQLitePendingStore
 
-            self._progressive_store = ProgressiveStoreAdapter(InMemoryPendingStore())
+                store = SQLitePendingStore(sel_cfg.pending_store_path.expanduser())
+                store.initialize()
+            else:
+                from memtomem_stm.proxy.pending_store import InMemoryPendingStore
+
+                store = InMemoryPendingStore()
+            self._progressive_store = ProgressiveStoreAdapter(store)
+            self._progressive_store_cfg = sel_cfg
         return self._progressive_store
 
-    def _apply_progressive(self, text: str, cfg: ProgressiveConfig, server: str, tool: str) -> str:
-        store = self._get_progressive_store()
+    def _apply_progressive(
+        self,
+        text: str,
+        cfg: ProgressiveConfig,
+        server: str,
+        tool: str,
+        sel_cfg: SelectiveConfig | None = None,
+    ) -> str:
+        store = self._get_progressive_store(sel_cfg)
         store.evict(cfg.ttl_seconds, cfg.max_stored)
 
         key = uuid.uuid4().hex[:16]
@@ -698,6 +761,24 @@ class ProxyManager:
             }
         return health
 
+    async def _on_cache_hit(
+        self,
+        cached: str,
+        server: str,
+        tool: str,
+        arguments: dict[str, Any],
+        trace_id: str,
+    ) -> str:
+        """Shared hit path: record metric, trace span, re-apply surfacing.
+
+        Called from both the stampede guard's fast-path check and its
+        post-lock double-check so concurrent duplicate requests return
+        through the same hit pipeline as a single call would.
+        """
+        self.tracker.record_cache_hit()
+        with traced("proxy_call_cache_hit", metadata={"server": server, "tool": tool}):
+            return await self._apply_surfacing(server, tool, arguments, cached, trace_id=trace_id)
+
     async def call_tool(self, server: str, tool: str, arguments: dict[str, Any]) -> str | list:
         """Forward a tool call to upstream, compress, surface, and return.
 
@@ -716,7 +797,7 @@ class ProxyManager:
             metadata={"server": server, "tool": tool, "trace_id": trace_id},
         ):
             try:
-                return await self._call_tool_inner(server, tool, arguments, trace_id=trace_id)
+                return await self._call_tool_guarded(server, tool, arguments, trace_id=trace_id)
             except Exception as exc:
                 # Upstream/transport/timeout/protocol errors are already
                 # recorded inside _call_tool_inner via record_error(); a raise
@@ -739,6 +820,53 @@ class ProxyManager:
                     except Exception:
                         logger.debug("Failed to record INTERNAL_ERROR metrics row", exc_info=True)
                 raise
+
+    async def _call_tool_guarded(
+        self,
+        server: str,
+        tool: str,
+        arguments: dict[str, Any],
+        *,
+        trace_id: str,
+    ) -> str | list:
+        """Cache stampede guard: serialize identical concurrent ``call_tool``
+        invocations on a per-key lock so a cold cache + duplicate requests
+        trigger one upstream call rather than N.
+
+        Structure: fast-path check (lock-free for cache hits) → per-key
+        ``asyncio.Lock`` with double-check (another coroutine may have
+        populated while we waited) → delegate to ``_call_tool_inner`` on
+        confirmed miss. The ``_key_locks`` dict entry is popped in
+        ``finally`` while the lock is still held so any waiter already
+        queued on the same lock sees the cached result on its own
+        double-check, and a new arrival after pop likewise finds the set
+        value (stampede window closed)."""
+        upstream_args = (
+            {k: v for k, v in arguments.items() if k != "_context_query"} if arguments else {}
+        )
+
+        # Fast-path: cache hit without lock contention.
+        if self._cache is not None:
+            cached = self._cache.get(server, tool, upstream_args)
+            if cached is not None:
+                return await self._on_cache_hit(cached, server, tool, arguments, trace_id)
+
+        # No cache configured — stampede protection N/A, go straight through.
+        if self._cache is None:
+            return await self._call_tool_inner(server, tool, arguments, trace_id=trace_id)
+
+        cache_key = _cache_key(server, tool, upstream_args)
+        lock = self._key_locks.setdefault(cache_key, asyncio.Lock())
+        async with lock:
+            try:
+                # Double-check inside the lock: a coroutine that held the
+                # lock ahead of us may have populated the cache already.
+                cached = self._cache.get(server, tool, upstream_args)
+                if cached is not None:
+                    return await self._on_cache_hit(cached, server, tool, arguments, trace_id)
+                return await self._call_tool_inner(server, tool, arguments, trace_id=trace_id)
+            finally:
+                self._key_locks.pop(cache_key, None)
 
     async def _call_tool_inner(
         self,
@@ -766,27 +894,23 @@ class ProxyManager:
             {k: v for k, v in arguments.items() if k != "_context_query"} if arguments else {}
         )
 
-        # ── Cache lookup ──
+        # Cache lookup + hit path handled by ``_call_tool_guarded``; by the
+        # time we get here the cache has already missed. Just account the
+        # miss and proceed with the upstream fetch.
         if self._cache is not None:
-            cached = self._cache.get(server, tool, upstream_args)
-            if cached is not None:
-                self.tracker.record_cache_hit()
-                # Re-apply surfacing on cache hit so memories stay fresh.
-                # Use original arguments (with _context_query) so the
-                # surfacing engine can use the agent's explicit query hint.
-                with traced(
-                    "proxy_call_cache_hit",
-                    metadata={"server": server, "tool": tool},
-                ):
-                    cached = await self._apply_surfacing(
-                        server, tool, arguments, cached, trace_id=trace_id
-                    )
-                return cached
             self.tracker.record_cache_miss()
 
         conn = self._connections[server]
         cfg = conn.config
         delay = cfg.reconnect_delay_seconds
+
+        # Snapshot the cache-key args BEFORE injecting ``_trace_id`` below.
+        # The cache lookup at L771 used the original args (no ``_trace_id``);
+        # if cache.set uses the mutated args, every stored entry is keyed on
+        # a per-request random hex and is unreachable by any future lookup
+        # (hit rate structurally 0%). Keep upstream args mutated for trace
+        # propagation, but persist under the original key.
+        cache_args = {**upstream_args}
 
         # Propagate trace context to upstream server for end-to-end correlation.
         if trace_id is not None:
@@ -1001,7 +1125,9 @@ class ProxyManager:
                 # Content fits in one chunk — passthrough
                 compressed = cleaned
             else:
-                compressed = self._apply_progressive(cleaned, pcfg, server, tool)
+                compressed = self._apply_progressive(
+                    cleaned, pcfg, server, tool, sel_cfg=tc.selective
+                )
             _compress_ms = 0.0
             compressed_chars_for_metrics = len(cleaned)
             # Skip surfacing for progressive — injecting memories would shift offsets
@@ -1096,7 +1222,9 @@ class ProxyManager:
                         # (has_more=False, nothing to read_more).
                         if cleaned_len > pcfg.chunk_size:
                             try:
-                                compressed = self._apply_progressive(cleaned, pcfg, server, tool)
+                                compressed = self._apply_progressive(
+                                    cleaned, pcfg, server, tool, sel_cfg=tc.selective
+                                )
                                 metrics_strategy = f"{original_strategy}→progressive_fallback"
                                 progressive_fallback = True
                                 logger.info(
@@ -1282,7 +1410,7 @@ class ProxyManager:
                 self._cache.set(
                     server,
                     tool,
-                    upstream_args,
+                    cache_args,
                     compressed,
                     ttl_seconds=cfg_snap.cache.default_ttl_seconds,
                 )

@@ -269,6 +269,106 @@ class TestLLMCompressorLifecycle:
         instance.close.assert_awaited_once()
         assert mgr._llm_compressor is None
 
+    async def test_config_swap_does_not_tear_down_in_flight_old_instance(self, tmp_path):
+        """Scenario A (regression): a compress() call holding the old
+        LLMCompressor instance must not see its httpx client closed when a
+        concurrent ``_apply_compression`` swaps in a new config.
+
+        The pre-fix code called ``await old.close()`` inline under the lock,
+        which tore the httpx client down while the first call was still
+        awaiting ``self._client.post(...)`` — surfacing as ``ClosedError``
+        / ``RuntimeError('stream has been closed')``.  The fix makes
+        ``close()`` wait on an in-flight gate so the old instance stays
+        usable until its in-flight caller drains.
+        """
+        import asyncio
+
+        from memtomem_stm.proxy.compression import LLMCompressor
+
+        mgr = _make_manager(tmp_path=tmp_path)
+        cfg1 = LLMCompressorConfig(provider=LLMProvider.OPENAI, api_key="k1")
+        cfg2 = LLMCompressorConfig(provider=LLMProvider.OPENAI, api_key="k2")
+
+        release_first = asyncio.Event()
+        first_started = asyncio.Event()
+        first_client_was_alive_at_completion = False
+
+        real_init = LLMCompressor.__init__
+        instances: list[LLMCompressor] = []
+
+        async def slow_first_call(text: str, *, max_chars: int) -> str:
+            first_started.set()
+            await release_first.wait()
+            nonlocal first_client_was_alive_at_completion
+            first_client_was_alive_at_completion = instances[0]._client is not None
+            return "first-summary"
+
+        async def fast_second_call(text: str, *, max_chars: int) -> str:
+            return "second-summary"
+
+        def tracked_init(self: LLMCompressor, config: LLMCompressorConfig) -> None:
+            real_init(self, config)
+            instances.append(self)
+            # Route _call_api based on config identity so the second
+            # instance (created during swap) gets the fast mock even though
+            # it hasn't been returned from any patch() context yet.
+            if config is cfg1:
+                self._call_api = slow_first_call  # type: ignore[method-assign]
+            else:
+                self._call_api = fast_second_call  # type: ignore[method-assign]
+
+        with patch.object(LLMCompressor, "__init__", tracked_init):
+            # Task A: compress with cfg1. Creates instances[0] with a slow
+            # _call_api that parks inside compress().
+            task_a = asyncio.create_task(
+                mgr._apply_compression(
+                    "x" * 500,
+                    CompressionStrategy.LLM_SUMMARY,
+                    max_chars=50,
+                    sel_cfg=None,
+                    llm_cfg=cfg1,
+                    hybrid_cfg=None,
+                    server="srv",
+                    tool="t",
+                )
+            )
+            await first_started.wait()
+
+            # Task B: compress with cfg2. Triggers swap whose close() must
+            # wait for A to drain before aclose()ing the cfg1 client.
+            task_b = asyncio.create_task(
+                mgr._apply_compression(
+                    "x" * 500,
+                    CompressionStrategy.LLM_SUMMARY,
+                    max_chars=50,
+                    sel_cfg=None,
+                    llm_cfg=cfg2,
+                    hybrid_cfg=None,
+                    server="srv",
+                    tool="t",
+                )
+            )
+            for _ in range(20):
+                await asyncio.sleep(0)
+            assert not task_a.done(), "A should still be in flight"
+            assert not task_b.done(), "B's swap-close should be waiting on A"
+            assert instances[0]._client is not None, (
+                "cfg1 client aclose'd before A drained — fix not applied"
+            )
+
+            release_first.set()
+            result_a, fb_a = await task_a
+            result_b, fb_b = await task_b
+
+        assert result_a == "first-summary"
+        assert result_b == "second-summary"
+        assert first_client_was_alive_at_completion, (
+            "cfg1 client was closed while A's compress was still mid-call"
+        )
+        assert instances[0]._client is None, "cfg1 client should have been aclose'd"
+        assert len(instances) == 2
+        assert mgr._llm_compressor is instances[1]
+
 
 # ── _apply_surfacing ─────────────────────────────────────────────────────
 
@@ -363,6 +463,73 @@ class TestReadMore:
 
         result = mgr.read_more("testkey", 0, 100)
         assert len(result) > 0
+
+    def test_progressive_store_uses_sqlite_when_configured(self, tmp_path):
+        """_get_progressive_store respects SelectiveConfig.pending_store='sqlite'."""
+        from memtomem_stm.proxy.pending_store import SQLitePendingStore
+
+        db_path = tmp_path / "progressive.db"
+        sel_cfg = SelectiveConfig(pending_store="sqlite", pending_store_path=db_path)
+        mgr = _make_manager(tmp_path=tmp_path)
+
+        store = mgr._get_progressive_store(sel_cfg)
+        assert isinstance(store._store, SQLitePendingStore)
+
+    def test_progressive_store_defaults_to_memory(self, tmp_path):
+        """Without sel_cfg, progressive store uses InMemoryPendingStore."""
+        from memtomem_stm.proxy.pending_store import InMemoryPendingStore
+
+        mgr = _make_manager(tmp_path=tmp_path)
+        store = mgr._get_progressive_store()
+        assert isinstance(store._store, InMemoryPendingStore)
+
+
+class TestSelectiveHotReload:
+    """Selective compressor must be recreated when config changes via hot-reload."""
+
+    async def test_selective_recreated_on_config_change(self, tmp_path):
+        from memtomem_stm.proxy.compression import SelectiveCompressor
+
+        mgr = _make_manager(
+            tmp_path=tmp_path, compression=CompressionStrategy.SELECTIVE
+        )
+        _inject_connection(mgr, "section1\n---\nsection2\n---\nsection3")
+
+        sel_cfg_a = SelectiveConfig(json_depth=1)
+        sel_cfg_b = SelectiveConfig(json_depth=3)
+
+        async with mgr._selective_lock:
+            mgr._selective_compressor = mgr._create_selective(sel_cfg_a)
+            mgr._selective_compressor_cfg = sel_cfg_a
+        comp_a = mgr._selective_compressor
+
+        async with mgr._selective_lock:
+            if mgr._selective_compressor_cfg != sel_cfg_b:
+                mgr._selective_compressor = mgr._create_selective(sel_cfg_b)
+                mgr._selective_compressor_cfg = sel_cfg_b
+        comp_b = mgr._selective_compressor
+
+        assert comp_a is not comp_b
+        assert mgr._selective_compressor_cfg == sel_cfg_b
+
+    async def test_selective_not_recreated_when_config_same(self, tmp_path):
+        mgr = _make_manager(
+            tmp_path=tmp_path, compression=CompressionStrategy.SELECTIVE
+        )
+        sel_cfg = SelectiveConfig(json_depth=2)
+
+        async with mgr._selective_lock:
+            mgr._selective_compressor = mgr._create_selective(sel_cfg)
+            mgr._selective_compressor_cfg = sel_cfg
+        comp_first = mgr._selective_compressor
+
+        async with mgr._selective_lock:
+            if mgr._selective_compressor_cfg != sel_cfg:
+                mgr._selective_compressor = mgr._create_selective(sel_cfg)
+                mgr._selective_compressor_cfg = sel_cfg
+        comp_second = mgr._selective_compressor
+
+        assert comp_first is comp_second
 
 
 # ── _auto_index_response ─────────────────────────────────────────────────

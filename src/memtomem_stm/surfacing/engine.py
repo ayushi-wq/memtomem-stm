@@ -80,6 +80,15 @@ class SurfacingEngine:
         self._boosted_event_ids: dict[str, None] = {}
         self._boosted_event_ids_max = 10000
         self._background_tasks: set[asyncio.Task] = set()
+        # Per-key stampede guard — identical concurrent ``_do_surface`` calls
+        # serialize on the same lock so a cache miss triggers one LTM search
+        # rather than N and the losing coroutine cannot overwrite the
+        # winning coroutine's populated cache entry with its own (empty due
+        # to session dedup) result. Entries are popped while the lock is
+        # still held so any queued waiter sees the cached result on its
+        # own double-check. Named ``_key_locks`` to match the same pattern
+        # used by ``ProxyManager`` (extractable into a shared helper later).
+        self._key_locks: dict[str, asyncio.Lock] = {}
         # Opportunistic cleanup: run cleanup_expired at most once per hour
         self._cleanup_interval = 3600.0
         self._last_cleanup: float = time.monotonic()
@@ -163,6 +172,11 @@ class SurfacingEngine:
         result = self._feedback_tracker.record_feedback(surfacing_id, rating, memory_id)
 
         if rating == "helpful" and surfacing_id not in self._boosted_event_ids:
+            # Claim the guard optimistically BEFORE the increment_access
+            # await so a concurrent "helpful" for the same surfacing_id
+            # observes the claim and short-circuits. Rolled back on failure
+            # so the documented "retry on failure" behavior is preserved.
+            self._boosted_event_ids[surfacing_id] = None
             try:
                 if memory_id:
                     target_ids: list[str] = [memory_id]
@@ -179,13 +193,17 @@ class SurfacingEngine:
                         },
                     ):
                         await self._mcp_adapter.increment_access(target_ids)
-                    self._boosted_event_ids[surfacing_id] = None
                     # Prune if exceeded cap — evict oldest (first-inserted) entries.
                     if len(self._boosted_event_ids) > self._boosted_event_ids_max:
                         excess = len(self._boosted_event_ids) - self._boosted_event_ids_max // 2
                         for k in list(self._boosted_event_ids)[:excess]:
                             del self._boosted_event_ids[k]
+                else:
+                    # No memories to boost — release the guard so a later
+                    # call with a resolvable memory_id can retry.
+                    self._boosted_event_ids.pop(surfacing_id, None)
             except Exception:
+                self._boosted_event_ids.pop(surfacing_id, None)
                 logger.debug(
                     "Failed to boost access_count for surfacing %s",
                     surfacing_id,
@@ -193,6 +211,47 @@ class SurfacingEngine:
                 )
 
         return result
+
+    def _render_cached(
+        self,
+        cached: list[Any],
+        response_text: str,
+        query: str,
+        server: str,
+        tool: str,
+    ) -> str:
+        """Render a cached surfacing result into the response_text, or pass
+        the response through unchanged if the cache entry is an empty list
+        (the deliberate "no results for this query" case).
+
+        Registers a new surfacing event in the feedback tracker so the agent
+        can submit ``stm_surfacing_feedback`` for the rendered surfacing_id.
+        Without this, cached hits generate orphan IDs that the feedback store
+        cannot resolve, silently breaking the feedback learning loop.
+        """
+        if not cached:
+            logger.debug("Surfacing cache hit (empty) for %s/%s", server, tool)
+            return response_text
+        logger.debug("Surfacing cache hit (%d results) for %s/%s", len(cached), server, tool)
+        surfacing_id = uuid.uuid4().hex[:16]
+        if self._feedback_tracker is not None:
+            try:
+                self._feedback_tracker.record_surfacing(
+                    surfacing_id=surfacing_id,
+                    server=server,
+                    tool=tool,
+                    query=query,
+                    memory_ids=[str(r.chunk.id) for r in cached],
+                    scores=[r.score for r in cached],
+                )
+            except Exception:
+                logger.warning("Failed to record cached surfacing event", exc_info=True)
+        return self._formatter.inject(
+            response_text,
+            cached,
+            query,
+            surfacing_id=surfacing_id,
+        )
 
     async def _do_surface(
         self,
@@ -204,22 +263,48 @@ class SurfacingEngine:
         *,
         trace_id: str | None = None,
     ) -> str:
-        # Check surfacing cache (keyed by server+tool+query)
+        # Check surfacing cache (keyed by server+tool+query). The full miss
+        # path lives in ``_do_surface_miss``; this shell handles the
+        # cache-check fast path, per-key stampede lock, and post-lock
+        # double-check so identical concurrent queries share a single LTM
+        # search and the losing coroutine cannot poison the cache with an
+        # empty result (see ``_key_locks`` init docstring).
         cache_key = f"{server}/{tool}/{query}"
         cached = self._cache.get(cache_key)
         if cached is not None:
-            if not cached:
-                logger.debug("Surfacing cache hit (empty) for %s/%s", server, tool)
-                return response_text
-            logger.debug("Surfacing cache hit (%d results) for %s/%s", len(cached), server, tool)
-            surfacing_id = uuid.uuid4().hex[:16]
-            return self._formatter.inject(
-                response_text,
-                cached,
-                query,
-                surfacing_id=surfacing_id,
-            )
+            return self._render_cached(cached, response_text, query, server, tool)
 
+        lock = self._key_locks.setdefault(cache_key, asyncio.Lock())
+        async with lock:
+            try:
+                # Double-check inside the lock: a coroutine that held the
+                # lock ahead of us may have populated the cache already.
+                cached = self._cache.get(cache_key)
+                if cached is not None:
+                    return self._render_cached(cached, response_text, query, server, tool)
+                return await self._do_surface_miss(
+                    server,
+                    tool,
+                    arguments,
+                    response_text,
+                    query,
+                    cache_key,
+                    trace_id=trace_id,
+                )
+            finally:
+                self._key_locks.pop(cache_key, None)
+
+    async def _do_surface_miss(
+        self,
+        server: str,
+        tool: str,
+        arguments: dict[str, Any],
+        response_text: str,
+        query: str,
+        cache_key: str,
+        *,
+        trace_id: str | None = None,
+    ) -> str:
         # Resolve effective config (auto-tuned if enabled)
         tool_cfg = self._config.context_tools.get(tool)
         if self._auto_tuner is not None:
@@ -272,6 +357,22 @@ class SurfacingEngine:
             )
             return response_text
 
+        # Record in-memory surfaced IDs EAGERLY — before any await — so a
+        # concurrent ``_do_surface`` for an overlapping memory observes the
+        # claim at L261 and excludes it. Without this, the await at
+        # ``scratch_list`` below opens an interleaving window where both
+        # coroutines build ``relevant`` including the same memory and
+        # violate the documented session-dedup invariant.
+        new_ids = [str(r.chunk.id) for r in relevant]
+        for mid in new_ids:
+            self._surfaced_ids[mid] = None
+        # Prune if exceeded cap — evict oldest (first-inserted) entries.
+        if len(self._surfaced_ids) > self._surfaced_ids_max:
+            excess = len(self._surfaced_ids) - self._surfaced_ids_max // 2
+            keys = list(self._surfaced_ids)[:excess]
+            for k in keys:
+                del self._surfaced_ids[k]
+
         self._gate.record_surfacing(query)
         logger.info(
             "Surfacing %d memories for %s/%s (query=%s)", len(relevant), server, tool, query[:50]
@@ -298,22 +399,14 @@ class SurfacingEngine:
                     server=server,
                     tool=tool,
                     query=query,
-                    memory_ids=[str(r.chunk.id) for r in relevant],
+                    memory_ids=new_ids,
                     scores=[r.score for r in relevant],
                 )
             except Exception:
                 logger.warning("Failed to record surfacing event", exc_info=True)
 
-        # Record surfaced IDs to suppress repeats (in-memory + persistent)
-        new_ids = [str(r.chunk.id) for r in relevant]
-        for mid in new_ids:
-            self._surfaced_ids[mid] = None
-        # Prune if exceeded cap — evict oldest (first-inserted) entries.
-        if len(self._surfaced_ids) > self._surfaced_ids_max:
-            excess = len(self._surfaced_ids) - self._surfaced_ids_max // 2
-            keys = list(self._surfaced_ids)[:excess]
-            for k in keys:
-                del self._surfaced_ids[k]
+        # Persist seen IDs for cross-session dedup (in-memory guard was
+        # claimed above to close the concurrent window).
         if self._feedback_tracker is not None:
             try:
                 self._feedback_tracker.store.mark_surfaced(new_ids)

@@ -323,6 +323,109 @@ class TestReconnectFailure:
         assert session.call_tool.call_count == 2
 
 
+# ── Reconnect cleans up partial stack on failure ────────────────────────
+
+
+class TestReconnectServerCleansUpOnFailure:
+    """If `_reconnect_server()` fails after entering the new transport+session
+    contexts (e.g. `session.initialize()` raises against an unreachable server),
+    the partially-entered AsyncExitStack must be aclosed so the new subprocess
+    and stdio streams aren't leaked across retry storms — otherwise repeated
+    transient failures pile up file descriptors and zombie processes.
+    """
+
+    async def test_initialize_failure_unwinds_stack(self, monkeypatch):
+        from memtomem_stm.proxy import manager as mod
+
+        transport_exited = asyncio.Event()
+        session_exited = asyncio.Event()
+
+        class FakeTransport:
+            async def __aenter__(self):
+                return (MagicMock(), MagicMock())
+
+            async def __aexit__(self, *args):
+                transport_exited.set()
+                return None
+
+        class FakeSession:
+            def __init__(self, *_args, **_kwargs):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                session_exited.set()
+                return None
+
+            async def initialize(self):
+                raise ConnectionError("simulated init failure")
+
+        mgr = _make_manager()
+        original_session = _get_session(mgr)
+        monkeypatch.setattr(mod, "ClientSession", FakeSession)
+        monkeypatch.setattr(mgr, "_open_transport", lambda cfg: FakeTransport())
+
+        with pytest.raises(ConnectionError, match="simulated init failure"):
+            await mgr._reconnect_server("srv")
+
+        assert transport_exited.is_set(), "transport context must be aclosed on init failure"
+        assert session_exited.is_set(), "session context must be aclosed on init failure"
+        # Connection state must not be partially mutated on failure.
+        assert mgr._connections["srv"].session is original_session
+        assert mgr._connections["srv"].stack is None
+
+
+# ── Background task race during stop() ──────────────────────────────────
+
+
+class TestBackgroundTasksStopRace:
+    """When ``stop()`` is draining ``_background_tasks``, a task added to the
+    set after ``asyncio.gather(...)`` has snapshotted its arguments must
+    still be cancelled. In production, a request-path coroutine can
+    schedule a background extraction after ``stop()`` began its drain but
+    before it completes, leaving the new task orphaned and potentially
+    accessing ``_extractor`` / ``_index_engine`` after they have been
+    closed."""
+
+    async def test_task_added_during_stop_gather_is_cancelled(self):
+        """Deterministic variant: an existing task, when cancelled by ``stop``,
+        schedules a new background task before re-raising. This mirrors the
+        production race (a ``call_tool`` in flight during shutdown scheduling
+        extraction) without relying on sleep timing."""
+        mgr = _make_manager()
+        added: list[asyncio.Task] = []
+
+        async def self_spawning_on_cancel():
+            try:
+                # Park indefinitely until cancelled.
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                # Simulate ``call_tool`` racing with shutdown — a background
+                # extraction is scheduled and added to ``_background_tasks``
+                # after ``stop()`` has already snapshotted the original set.
+                new = asyncio.create_task(asyncio.sleep(5))
+                mgr._background_tasks.add(new)
+                added.append(new)
+                raise
+
+        existing = asyncio.create_task(self_spawning_on_cancel())
+        mgr._background_tasks.add(existing)
+        # Let the task start and park on the wait() before stop() cancels it,
+        # so cancellation triggers the except block rather than a cancel-
+        # before-start shortcut.
+        await asyncio.sleep(0)
+
+        await mgr.stop()
+
+        assert added, "self_spawning_on_cancel did not schedule follow-up task"
+        assert added[0].done() or added[0].cancelled(), (
+            "Task added to _background_tasks during stop()'s gather was "
+            "neither cancelled nor awaited — it leaks past stop()"
+        )
+
+
 # ── Zero retries configuration ──────────────────────────────────────────
 
 
@@ -630,7 +733,9 @@ class TestCacheWithErrors:
             with pytest.raises(ConnectionError):
                 await mgr.call_tool("srv", "tool", {})
 
-        cache.get.assert_called_once()
+        # ``cache.get`` is called twice: once on the stampede guard's
+        # lock-free fast-path, once on the post-lock double-check.
+        assert cache.get.call_count == 2
         mgr.tracker.get_summary()  # should record cache miss
         assert mgr.tracker.get_summary()["cache_misses"] == 1
 
@@ -648,6 +753,90 @@ class TestCacheWithErrors:
         assert result == "cached result"
         session.call_tool.assert_not_called()
         assert mgr.tracker.get_summary()["cache_hits"] == 1
+
+    async def test_cache_roundtrip_is_reachable_with_trace_id_propagation(self, tmp_path):
+        """End-to-end cache round-trip: a real ``ProxyCache`` backed by
+        SQLite must observe a hit on a second call with identical args,
+        *even while ``_trace_id`` is being injected into the upstream args
+        for observability*. The bug this regression protects against —
+        ``upstream_args["_trace_id"] = trace_id`` mutating the same dict
+        that later feeds ``cache.set`` — makes every stored entry keyed
+        on a per-request random hex, so no future lookup can ever match
+        (cache hit rate structurally 0%).
+
+        Uses a real ``ProxyCache``, not ``MagicMock``, because mock-backed
+        tests don't enforce key equality between ``get`` and ``set`` and
+        so can't detect the mutation bug."""
+        from memtomem_stm.proxy.cache import ProxyCache
+
+        mgr = _make_manager(tmp_path=tmp_path)
+        session = _get_session(mgr)
+        session.call_tool.side_effect = [_make_result("upstream payload")]
+
+        cache = ProxyCache(tmp_path / "cache.db", max_entries=10)
+        cache.initialize()
+        mgr._cache = cache
+        try:
+            # First call: miss → upstream → set.
+            r1 = await mgr.call_tool("srv", "tool", {"x": 1})
+            assert "upstream payload" in r1
+            assert session.call_tool.call_count == 1
+
+            # Second call with the SAME args: must hit cache (no upstream).
+            r2 = await mgr.call_tool("srv", "tool", {"x": 1})
+            assert "upstream payload" in r2
+            assert session.call_tool.call_count == 1, (
+                "Cache round-trip broken: second identical call went to "
+                f"upstream ({session.call_tool.call_count} calls). "
+                "cache.set key likely diverged from cache.get key "
+                "(e.g. trace_id injection mutating the shared args dict)."
+            )
+        finally:
+            cache.close()
+
+    async def test_concurrent_identical_requests_stampede_on_miss(self):
+        """Two concurrent ``call_tool`` invocations with identical
+        ``(server, tool, args)`` and a cold cache should result in a
+        **single** upstream ``session.call_tool`` — otherwise every
+        duplicate request pays the full upstream cost (LLM tokens,
+        rate-limit budget, latency). The ``cache.get`` fast-path and the
+        eventual ``cache.set`` inside ``_call_tool_inner`` are separated
+        by the ``await session.call_tool`` plus the compression /
+        extraction pipeline, so without a per-key lock both coroutines
+        see a miss before either writes back."""
+        mgr = _make_manager()
+        session = _get_session(mgr)
+
+        call_count = 0
+
+        async def slow_upstream(tool, args):
+            nonlocal call_count
+            call_count += 1
+            await asyncio.sleep(0.01)  # keep the first call in flight
+            return _make_result(f"result-{call_count}")
+
+        session.call_tool.side_effect = slow_upstream
+
+        cache_store: dict[str, str] = {}
+
+        cache = MagicMock()
+        cache.get.side_effect = lambda srv, tl, a: cache_store.get(f"{srv}|{tl}|{a}")
+
+        def _set(srv, tl, a, result, ttl_seconds=None):
+            cache_store[f"{srv}|{tl}|{a}"] = result
+
+        cache.set.side_effect = _set
+        mgr._cache = cache
+
+        await asyncio.gather(
+            mgr.call_tool("srv", "tool", {"x": 1}),
+            mgr.call_tool("srv", "tool", {"x": 1}),
+        )
+
+        assert session.call_tool.call_count == 1, (
+            "Cache stampede: identical concurrent requests both hit upstream "
+            f"({session.call_tool.call_count} upstream calls for the same key)"
+        )
 
     async def test_cache_set_failure_does_not_break_response(self):
         """A failing ``cache.set`` (SQLite lock timeout, disk full, etc.)

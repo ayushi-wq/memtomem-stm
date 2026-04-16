@@ -261,6 +261,124 @@ class TestSurfacingCache:
         assert adapter.search.call_count == 1  # not called again
 
 
+class TestSurfacingCacheStampede:
+    """Two concurrent ``surface()`` calls for the same ``{server}/{tool}/{query}``
+    cache key should trigger a single LTM search, not one per caller. The
+    cache exists specifically to avoid redundant LTM searches; under the
+    current check-then-await-then-set pattern (engine.py:209 get, L248 await
+    search, L267 set), the ``await`` window lets both coroutines observe a
+    miss before either writes back, so both hit LTM."""
+
+    async def test_concurrent_identical_queries_share_single_search(self):
+        """Three observable symptoms of the stampede, in order of severity:
+
+        1. Duplicate LTM search (wasted upstream load).
+        2. Second caller fails to receive the surfaced memory because the
+           session dedup (``_surfaced_ids``) was claimed by the first caller
+           between the two searches completing.
+        3. Cache poisoning: the second caller's ``cache.set(key, [])``
+           overwrites the first caller's ``cache.set(key, [memory])``, so
+           every subsequent call for the same query inside the TTL window
+           sees an empty-hit and skips surfacing entirely.
+
+        Of these, (3) is the most impactful — a transient race permanently
+        (for the TTL) suppresses surfacing for a query across future
+        requests."""
+        chunk = FakeChunk(id="mem-shared", content="shared result")
+        results = [FakeSearchResult(chunk=chunk, score=0.5)]
+        adapter = AsyncMock()
+
+        async def slow_search(**_kwargs):
+            await asyncio.sleep(0.01)
+            return (results, {})
+
+        adapter.search = AsyncMock(side_effect=slow_search)
+
+        engine = SurfacingEngine(
+            config=_make_config(),
+            mcp_adapter=adapter,
+        )
+
+        out_a, out_b = await asyncio.gather(
+            engine.surface("gh", "read_file", VALID_ARGS, LONG_RESPONSE),
+            engine.surface("gh", "read_file", VALID_ARGS, LONG_RESPONSE),
+        )
+
+        # Symptom 1: duplicate LTM search
+        assert adapter.search.call_count == 1, (
+            f"Stampede: {adapter.search.call_count} LTM searches for the "
+            "same {server}/{tool}/{query} cache key (expected 1)"
+        )
+
+        # Symptom 2: both callers should see the memory.
+        assert "shared result" in out_a
+        assert "shared result" in out_b, (
+            "Second concurrent caller did not receive the shared memory — "
+            "the in-flight first caller claimed the _surfaced_ids slot "
+            "before the second caller's filter ran"
+        )
+
+        # Symptom 3: cache entry reflects the populated result, not the
+        # poisoned empty list. A subsequent call for the same query must
+        # still hit the memory, not bypass surfacing on an empty-hit.
+        cache_key = f"gh/read_file/{VALID_ARGS['_context_query']}"
+        cached = engine._cache.get(cache_key)
+        assert cached, (
+            "Cache poisoned with empty list — stampede's losing writer "
+            "overwrote the winning writer's populated cache entry"
+        )
+        assert any(r.chunk.id == "mem-shared" for r in cached), (
+            "Cache entry exists but is missing the shared memory"
+        )
+
+
+class TestRelevanceGateConcurrency:
+    """``RelevanceGate.should_surface`` is called at ``surface()`` entry and
+    ``record_surfacing`` is called later inside ``_do_surface_miss`` (after
+    the LTM search ``await``). Concurrent ``surface()`` calls can all pass
+    ``should_surface`` (rate limit + cooldown check) before any of them
+    reaches ``record_surfacing``, so the configured rate limit is bypassed
+    by up to the concurrency level."""
+
+    async def test_concurrent_surface_calls_bypass_rate_limit(self):
+        # Rate-limit config = 1 surfacing per minute. Under the race,
+        # N concurrent calls all observe an empty ``_surfacing_timestamps``
+        # before any writes back, so all N pass the gate.
+        adapter = AsyncMock()
+
+        async def slow_search(**_kwargs):
+            await asyncio.sleep(0.01)
+            return ([FakeSearchResult(chunk=FakeChunk(content="hit"), score=0.5)], {})
+
+        adapter.search = AsyncMock(side_effect=slow_search)
+
+        engine = SurfacingEngine(
+            config=_make_config(max_surfacings_per_minute=1),
+            mcp_adapter=adapter,
+        )
+
+        # 5 distinct cache keys so the cache stampede fix doesn't mask the
+        # race (each query has its own ``_do_surface`` miss path).
+        await asyncio.gather(
+            *(
+                engine.surface(
+                    "gh",
+                    "read_file",
+                    {"path": f"src/f{i}.py", "_context_query": f"query {i}"},
+                    LONG_RESPONSE,
+                )
+                for i in range(5)
+            )
+        )
+
+        assert adapter.search.call_count == 1, (
+            "Rate limit bypassed under concurrency: "
+            f"{adapter.search.call_count} LTM searches fired with "
+            "max_surfacings_per_minute=1 — all should_surface checks "
+            "passed before any record_surfacing wrote back"
+        )
+
+
 class TestSessionContextInjection:
     """Verify include_session_context wires the scratchpad through the MCP adapter."""
 
@@ -306,6 +424,81 @@ class TestSessionContextInjection:
         assert "LTM hit content" in output
         assert "Working Memory" not in output
         adapter.scratch_list.assert_awaited_once()
+
+
+class TestCachedSurfacingFeedback:
+    """Cached surfacing hits must record a surfacing event so that agent
+    feedback submitted with the rendered surfacing_id can be resolved by
+    the feedback store."""
+
+    async def test_cache_hit_records_surfacing_event(self):
+        """record_surfacing must be called for both the miss AND the cache hit."""
+        results = [FakeSearchResult(chunk=FakeChunk(id="m1", content="mem"), score=0.7)]
+        adapter = _make_mcp_adapter(results)
+        tracker = MagicMock()
+        tracker.record_surfacing = MagicMock()
+        tracker.store = MagicMock()
+        tracker.store.mark_surfaced = MagicMock()
+        tracker.store.get_seen_ids = MagicMock(return_value=[])
+
+        engine = SurfacingEngine(
+            config=_make_config(cooldown_seconds=0),
+            mcp_adapter=adapter,
+            feedback_tracker=tracker,
+        )
+
+        # First call — cache miss
+        await engine.surface("gh", "read_file", VALID_ARGS, LONG_RESPONSE)
+        assert tracker.record_surfacing.call_count == 1
+
+        # Second call — cache hit
+        await engine.surface("gh", "read_file", VALID_ARGS, LONG_RESPONSE)
+        assert tracker.record_surfacing.call_count == 2
+
+        # Both calls should produce distinct surfacing_ids
+        id1 = tracker.record_surfacing.call_args_list[0].kwargs["surfacing_id"]
+        id2 = tracker.record_surfacing.call_args_list[1].kwargs["surfacing_id"]
+        assert id1 != id2
+
+    async def test_cache_hit_feedback_resolvable(self):
+        """End-to-end: feedback on a cached surfacing_id must succeed."""
+        from memtomem_stm.surfacing.feedback import FeedbackTracker
+
+        results = [FakeSearchResult(chunk=FakeChunk(id="m2", content="cached mem"), score=0.6)]
+        adapter = _make_mcp_adapter(results)
+
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "fb.db"
+            tracker = FeedbackTracker(config=_make_config(), db_path=db_path)
+
+            engine = SurfacingEngine(
+                config=_make_config(cooldown_seconds=0),
+                mcp_adapter=adapter,
+                feedback_tracker=tracker,
+            )
+
+            # Miss → populates cache
+            out1 = await engine.surface("gh", "read_file", VALID_ARGS, LONG_RESPONSE)
+            assert "Surfacing ID:" in out1
+
+            # Cache hit → new surfacing_id recorded
+            out2 = await engine.surface("gh", "read_file", VALID_ARGS, LONG_RESPONSE)
+            assert "Surfacing ID:" in out2
+
+            # Extract the surfacing_id from the second (cached) output
+            import re
+
+            match = re.search(r"Surfacing ID: (\w+)", out2)
+            assert match, "surfacing_id not found in cached output"
+            cached_sid = match.group(1)
+
+            # Feedback for the cached surfacing_id must succeed
+            result = await engine.handle_feedback(cached_sid, "helpful")
+            assert "Error" not in result
+
+            tracker.close()
 
     async def test_empty_scratch_list_omits_section(self):
         results = [FakeSearchResult(chunk=FakeChunk(content="LTM hit content"), score=0.5)]
@@ -430,6 +623,36 @@ class TestFeedbackBoost:
 
         adapter.increment_access.assert_not_called()
 
+    async def test_concurrent_helpful_for_same_surfacing_id_boosts_once(self):
+        """Two concurrent ``handle_feedback`` calls for the same ``surfacing_id``
+        must fire a single ``increment_access`` RPC — the class docstring and
+        ``_boosted_event_ids`` guard promise "at most one per surfacing event"
+        even under concurrency. Without claiming the guard before the await,
+        both coroutines observe an empty guard, both await ``increment_access``,
+        and the boost is double-counted in core."""
+        adapter = _make_mcp_adapter([])
+
+        async def slow_increment(_ids):
+            await asyncio.sleep(0.01)
+
+        adapter.increment_access = AsyncMock(side_effect=slow_increment)
+        tracker = self._make_tracker(["mid-A"])
+        engine = SurfacingEngine(
+            config=_make_config(),
+            mcp_adapter=adapter,
+            feedback_tracker=tracker,
+        )
+
+        await asyncio.gather(
+            engine.handle_feedback("sid-concurrent", "helpful", memory_id="mid-A"),
+            engine.handle_feedback("sid-concurrent", "helpful", memory_id="mid-A"),
+        )
+
+        assert adapter.increment_access.await_count == 1, (
+            "Dedup guard violated under concurrency: "
+            f"increment_access awaited {adapter.increment_access.await_count} times"
+        )
+
     async def test_boosted_event_ids_fifo_cap_evicts_oldest(self):
         """When ``_boosted_event_ids`` exceeds its cap, oldest entries evict first."""
         adapter = _make_mcp_adapter([])
@@ -464,6 +687,66 @@ class TestFeedbackBoost:
 
         assert "not enabled" in result
         adapter.increment_access.assert_not_called()
+
+
+class TestConcurrentSurfacedIdsDedup:
+    """Dedup invariant: each memory surfaced at most once per session, even
+    under concurrency (engine.py:62 / L256 / docstring).
+
+    Before the fix, the in-memory write at ``_surfaced_ids`` happened AFTER
+    the ``scratch_list`` await, opening an interleaving window where two
+    concurrent ``_do_surface`` calls could both build ``relevant`` with the
+    same memory and both return responses containing it."""
+
+    def _make_tracker(self):
+        tracker = MagicMock()
+        tracker.record_feedback = MagicMock(return_value="ok")
+        tracker.store = MagicMock()
+        tracker.store.get_seen_ids = MagicMock(return_value=set())
+        tracker.store.mark_surfaced = MagicMock()
+        tracker.record_surfacing = MagicMock()
+        return tracker
+
+    async def test_concurrent_surface_same_memory_dedups(self):
+        shared_chunk = FakeChunk(id="mem-shared", content="the shared memory content")
+        results = [FakeSearchResult(chunk=shared_chunk, score=0.9)]
+        adapter = _make_mcp_adapter(results)
+
+        async def slow_scratch(**_kwargs):
+            await asyncio.sleep(0.01)
+            return []
+
+        adapter.scratch_list = AsyncMock(side_effect=slow_scratch)
+        adapter.increment_access = AsyncMock()
+
+        tracker = self._make_tracker()
+        engine = SurfacingEngine(
+            config=_make_config(include_session_context=True),
+            mcp_adapter=adapter,
+            feedback_tracker=tracker,
+        )
+
+        out_a, out_b = await asyncio.gather(
+            engine.surface(
+                "gh",
+                "read_file",
+                {"path": "src/a.py", "_context_query": "Flask architecture"},
+                LONG_RESPONSE,
+            ),
+            engine.surface(
+                "gh",
+                "search",
+                {"path": "src/b.py", "_context_query": "Django routes"},
+                LONG_RESPONSE,
+            ),
+        )
+
+        appears_in_a = "the shared memory content" in out_a
+        appears_in_b = "the shared memory content" in out_b
+        assert not (appears_in_a and appears_in_b), (
+            "Session dedup violated under concurrency: shared memory surfaced "
+            "in both concurrent responses"
+        )
 
 
 class TestMaybeCleanupExpired:
