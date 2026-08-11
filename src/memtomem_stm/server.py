@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import logging
 import os
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from typing import Any
 
 from mcp.server.fastmcp import Context, FastMCP
 from mcp.server.session import ServerSession
@@ -175,8 +176,10 @@ async def app_lifespan(server: FastMCP) -> AsyncIterator[STMContext]:
             # Register proxy tools with upstream schema + annotations
             from memtomem_stm.proxy._fastmcp_compat import register_proxy_tool
 
-            def _make_proxy_handler(pm: ProxyManager, server_name: str, tool_name: str):  # noqa: ANN202
-                async def proxy_tool(**kwargs: object) -> str | list:
+            def _make_proxy_handler(
+                pm: ProxyManager, server_name: str, tool_name: str
+            ) -> Callable[..., Awaitable[str | list]]:  # noqa: ANN202
+                async def proxy_tool(**kwargs: Any) -> str | list:
                     return await pm.call_tool(server_name, tool_name, dict(kwargs))
 
                 return proxy_tool

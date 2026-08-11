@@ -14,12 +14,16 @@ from memtomem_stm.surfacing.config import SurfacingConfig
 class LangfuseConfig(BaseModel):
     """Langfuse tracing configuration."""
 
-    enabled: bool = False
-    public_key: str = ""
-    secret_key: str = ""
-    host: str = ""
-    sampling_rate: float = Field(default=1.0, ge=0.0, le=1.0)
-    """Fraction of proxy calls to trace (0.0–1.0).  Default 1.0 = all."""
+    enabled: bool = Field(default=False, description="Whether Langfuse tracing is enabled.")
+    public_key: str = Field(default="", description="Langfuse public key.")
+    secret_key: str = Field(default="", description="Langfuse secret key.")
+    host: str = Field(default="", description="Langfuse host URL.")
+    sampling_rate: float = Field(
+        default=1.0, 
+        ge=0.0, 
+        le=1.0, 
+        description="Fraction of proxy calls to trace (0.0-1.0). Default 1.0 = all."
+    )
 
     @model_validator(mode="after")
     def _require_keys_when_enabled(self) -> "LangfuseConfig":
@@ -32,15 +36,29 @@ class LangfuseConfig(BaseModel):
 
 
 class STMConfig(BaseSettings):
+    """Root configuration for the Short-Term Memory service."""
+
     model_config = SettingsConfigDict(
         env_prefix="MEMTOMEM_STM_",
         env_nested_delimiter="__",
     )
 
-    proxy: ProxyConfig = Field(default_factory=ProxyConfig)
-    surfacing: SurfacingConfig = Field(default_factory=SurfacingConfig)
-    langfuse: LangfuseConfig = Field(default_factory=LangfuseConfig)
-    data_dir: Path = Path("~/.memtomem")
+    proxy: ProxyConfig = Field(
+        default_factory=ProxyConfig, 
+        description="Proxy service configuration."
+    )
+    surfacing: SurfacingConfig = Field(
+        default_factory=SurfacingConfig, 
+        description="Surfacing logic configuration."
+    )
+    langfuse: LangfuseConfig = Field(
+        default_factory=LangfuseConfig, 
+        description="Langfuse tracing configuration."
+    )
+    data_dir: Path = Field(
+        default=Path("~/.memtomem"), 
+        description="Base directory for memory data storage."
+    )
 
     def model_post_init(self, __context: object) -> None:
         # Propagate consumer_model from proxy to surfacing for model-aware defaults
