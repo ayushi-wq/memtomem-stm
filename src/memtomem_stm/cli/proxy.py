@@ -68,7 +68,11 @@ def cli() -> None:
 @cli.command()
 @click.option("--config", "config_path", default=str(_DEFAULT_CONFIG), show_default=True)
 def status(config_path: str) -> None:
-    """Show proxy gateway configuration and server list."""
+    """Show proxy gateway configuration and server list.
+    
+    Args:
+        config_path: Path to the proxy configuration file.
+    """
     path = Path(config_path)
     resolved = path.expanduser().resolve()
 
@@ -105,7 +109,11 @@ def status(config_path: str) -> None:
 @cli.command(name="list")
 @click.option("--config", "config_path", default=str(_DEFAULT_CONFIG), show_default=True)
 def list_servers(config_path: str) -> None:
-    """List configured upstream servers."""
+    """List configured upstream servers.
+    
+    Args:
+        config_path: Path to the proxy configuration file.
+    """
     data = _load(Path(config_path))
     servers: dict[str, Any] = data.get("upstream_servers", {})
 
@@ -163,7 +171,20 @@ def add(
     compression: str,
     max_result_chars: int,
 ) -> None:
-    """Add an upstream MCP server to the proxy configuration."""
+    """Add an upstream MCP server to the proxy configuration.
+    
+    Args:
+        name: Name of the upstream server.
+        config_path: Path to the proxy configuration file.
+        command: Executable command for stdio transport.
+        args_str: Space-separated arguments for the command.
+        prefix: Tool name prefix to avoid conflicts.
+        transport: Transport type (stdio, sse, streamable_http).
+        url: Endpoint URL for SSE or HTTP transports.
+        env_pairs: Environment variables as KEY=VALUE pairs.
+        compression: Compression strategy to use.
+        max_result_chars: Maximum characters to return before compressing.
+    """
     path = Path(config_path)
     data = _load(path)
     servers: dict[str, Any] = data.setdefault("upstream_servers", {})
@@ -249,7 +270,13 @@ def add(
 @click.option("--config", "config_path", default=str(_DEFAULT_CONFIG), show_default=True)
 @click.option("--yes", "-y", is_flag=True, help="Skip confirmation.")
 def remove(name: str, config_path: str, yes: bool) -> None:
-    """Remove an upstream MCP server from the proxy configuration."""
+    """Remove an upstream MCP server from the proxy configuration.
+    
+    Args:
+        name: Name of the server to remove.
+        config_path: Path to the proxy configuration file.
+        yes: Skip confirmation prompt if true.
+    """
     path = Path(config_path)
     data = _load(path)
     servers: dict[str, Any] = data.get("upstream_servers", {})
