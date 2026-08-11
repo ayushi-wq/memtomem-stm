@@ -193,8 +193,17 @@ class ProxyManager:
         for name, cfg in servers.items():
             try:
                 await self._connect_server(name, cfg, seen_prefixed)
+            except (ConnectionError, OSError, asyncio.TimeoutError) as e:
+                logger.error(
+                    "Failed to connect to upstream server '%s' (transport): %s",
+                    name,
+                    e,
+                )
             except Exception:
-                logger.exception("Failed to connect to upstream server '%s'", name)
+                logger.exception(
+                    "Failed to connect to upstream server '%s' (unexpected)",
+                    name,
+                )
 
     def _open_transport(self, cfg: UpstreamServerConfig):  # noqa: ANN201
         match cfg.transport:
@@ -592,9 +601,19 @@ class ProxyManager:
                 response_text=text,
                 trace_id=trace_id,
             )
+        except (ConnectionError, OSError, asyncio.TimeoutError) as e:
+            logger.warning(
+                "Surfacing failed for %s/%s (transport): %s"
+                " — using compressed response",
+                server,
+                tool,
+                e,
+            )
+            return text
         except Exception:
             logger.warning(
-                "Surfacing failed for %s/%s, using compressed response",
+                "Surfacing failed for %s/%s (unexpected)"
+                " — using compressed response",
                 server,
                 tool,
                 exc_info=True,

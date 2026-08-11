@@ -72,7 +72,11 @@ class SurfacingEngine:
                         len(self._surfaced_ids),
                     )
             except Exception:
-                logger.warning("Failed to load cross-session seen IDs", exc_info=True)
+                logger.warning(
+                    "Failed to load cross-session seen IDs from feedback store"
+                    " — session dedup will start fresh",
+                    exc_info=True,
+                )
         # In-memory boost guard — at most one mem_do(increment_access) call
         # per surfacing event, even if the agent fires multiple "helpful"
         # ratings for it. Insertion-ordered dict for FIFO eviction; cap at
@@ -148,7 +152,12 @@ class SurfacingEngine:
             )
             return response_text
         except Exception:
-            logger.warning("Surfacing failed for %s/%s", server, tool, exc_info=True)
+            logger.warning(
+                "Surfacing failed for %s/%s — returning unmodified response",
+                server,
+                tool,
+                exc_info=True,
+            )
             self._circuit_breaker.record_failure()
             return response_text
 
@@ -205,7 +214,8 @@ class SurfacingEngine:
             except Exception:
                 self._boosted_event_ids.pop(surfacing_id, None)
                 logger.debug(
-                    "Failed to boost access_count for surfacing %s",
+                    "Failed to boost access_count for surfacing %s"
+                    " — rolled back guard for retry",
                     surfacing_id,
                     exc_info=True,
                 )
@@ -245,7 +255,13 @@ class SurfacingEngine:
                     scores=[r.score for r in cached],
                 )
             except Exception:
-                logger.warning("Failed to record cached surfacing event", exc_info=True)
+                logger.warning(
+                    "Failed to record cached surfacing event %s for %s/%s",
+                    surfacing_id,
+                    server,
+                    tool,
+                    exc_info=True,
+                )
         return self._formatter.inject(
             response_text,
             cached,
@@ -403,7 +419,14 @@ class SurfacingEngine:
                     scores=[r.score for r in relevant],
                 )
             except Exception:
-                logger.warning("Failed to record surfacing event", exc_info=True)
+                logger.warning(
+                    "Failed to record surfacing event %s for %s/%s"
+                    " — feedback may not resolve this ID",
+                    surfacing_id,
+                    server,
+                    tool,
+                    exc_info=True,
+                )
 
         # Persist seen IDs for cross-session dedup (in-memory guard was
         # claimed above to close the concurrent window).
@@ -411,7 +434,11 @@ class SurfacingEngine:
             try:
                 self._feedback_tracker.store.mark_surfaced(new_ids)
             except Exception:
-                logger.warning("Failed to persist seen memory IDs", exc_info=True)
+                logger.warning(
+                    "Failed to persist %d seen memory IDs for cross-session dedup",
+                    len(new_ids),
+                    exc_info=True,
+                )
 
         # Inject memories into response
         result = self._formatter.inject(
@@ -477,4 +504,8 @@ class SurfacingEngine:
             if deleted:
                 logger.info("Cleaned up %d expired seen_memories entries", deleted)
         except Exception:
-            logger.warning("Failed to clean up expired seen_memories", exc_info=True)
+            logger.warning(
+                "Failed to clean up expired seen_memories entries"
+                " — stale dedup entries may accumulate",
+                exc_info=True,
+            )

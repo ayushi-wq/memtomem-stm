@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 from collections.abc import AsyncIterator
@@ -95,9 +96,17 @@ async def app_lifespan(server: FastMCP) -> AsyncIterator[STMContext]:
                         config.proxy.compression_feedback.db_path,
                         metrics_store=metrics_store,
                     )
+                except (OSError, ValueError) as e:
+                    logger.warning(
+                        "Compression feedback tracker init failed (storage/config): %s"
+                        " — tool will be disabled",
+                        e,
+                    )
+                    compression_feedback_tracker = None
                 except Exception:
                     logger.warning(
-                        "Compression feedback tracker init failed — tool will be disabled",
+                        "Compression feedback tracker init failed (unexpected)"
+                        " — tool will be disabled",
                         exc_info=True,
                     )
                     compression_feedback_tracker = None
@@ -116,9 +125,17 @@ async def app_lifespan(server: FastMCP) -> AsyncIterator[STMContext]:
                         "Surfacing engine connected via MCP client to %s",
                         config.surfacing.ltm_mcp_command,
                     )
+                except (ConnectionError, OSError, asyncio.TimeoutError) as e:
+                    logger.warning(
+                        "MCP client surfacing init failed (connection): %s"
+                        " — surfacing disabled",
+                        e,
+                    )
+                    mcp_adapter = None
                 except Exception:
                     logger.warning(
-                        "MCP client surfacing initialization failed — surfacing disabled",
+                        "MCP client surfacing init failed (unexpected)"
+                        " — surfacing disabled",
                         exc_info=True,
                     )
                     mcp_adapter = None
@@ -127,9 +144,17 @@ async def app_lifespan(server: FastMCP) -> AsyncIterator[STMContext]:
                     if config.surfacing.feedback_enabled:
                         try:
                             feedback_tracker = FeedbackTracker(config.surfacing)
+                        except (OSError, ValueError) as e:
+                            logger.warning(
+                                "FeedbackTracker init failed (storage/config): %s"
+                                " — surfacing feedback disabled",
+                                e,
+                            )
+                            feedback_tracker = None
                         except Exception:
                             logger.warning(
-                                "FeedbackTracker init failed — surfacing feedback disabled",
+                                "FeedbackTracker init failed (unexpected)"
+                                " — surfacing feedback disabled",
                                 exc_info=True,
                             )
                             feedback_tracker = None
